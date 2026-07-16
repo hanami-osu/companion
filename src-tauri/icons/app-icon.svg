@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Hanami Companion icon">
+  <rect width="1024" height="1024" rx="224" fill="#121216"/>
+  <path d="M264 248h132v198h232V248h132v528H628V574H396v202H264V248Z" fill="#F4F4F5"/>
+  <circle cx="760" cy="264" r="96" fill="#F472B6"/>
+  <circle cx="760" cy="264" r="28" fill="#121216"/>
+</svg>

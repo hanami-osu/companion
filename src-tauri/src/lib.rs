@@ -1,73 +1,62 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-mod hanami_api;
+mod activity;
+mod app_state;
+mod auth;
+mod commands;
+pub mod hanami;
 mod tosu;
-mod ws_client;
+mod tray;
 
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
-    Manager,
-};
+use app_state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(tosu::TosuState {
-            process: std::sync::Mutex::new(None),
-        })
-        .manage(ws_client::TosuConnectionState::default())
-        .manage(tokio::sync::Mutex::new(hanami_api::HanamiClient::new()))
+        .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
-            greet,
-            tosu::toggle_tosu,
-            tosu::is_tosu_running,
-            ws_client::is_tosu_connected
+            commands::get_snapshot,
+            commands::set_tracking_enabled,
+            commands::launch_tosu,
+            commands::stop_owned_tosu,
+            commands::grant_tosu_memory_access,
+            commands::connect_hanami,
+            commands::disconnect_hanami,
+            commands::open_tosu_dashboard,
+            commands::open_hanami_website,
         ])
         .setup(|app| {
-            ws_client::start_tosu_listener(app.handle().clone());
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let toggle_i = MenuItem::with_id(app, "toggle", "Show/Hide", true, None::<&str>)?;
-            let toggle_t = MenuItem::with_id(
-                app,
-                "toggle-tosu",
-                "Enable/Disable tosu",
-                true,
-                None::<&str>,
-            )?;
-            let menu = Menu::with_items(app, &[&toggle_i, &quit_i])?;
-
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
-                        // kill tosu first, then exit the app
-                        let state = app.state::<tosu::TosuState>();
-                        if let Some(p) = state.process.lock().unwrap().take() {
-                            let _ = p.kill();
-                        }
-
-                        app.exit(0);
-                    }
-                    "toggle" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    _ => {}
-                })
-                .build(app)?;
-
+            tray::setup(app)?;
+            tosu::start_listener(app.handle().clone());
+            auth::start_supervisor(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("failed to build Hanami Companion");
+
+    app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            shutdown(app);
+        }
+    });
+}
+
+pub(crate) fn shutdown(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if !state.begin_shutdown() {
+        return;
+    }
+    let mut process = state
+        .process
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    process.stop_owned_on_shutdown();
 }

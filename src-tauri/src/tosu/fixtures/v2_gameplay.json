@@ -1,0 +1,31 @@
+{
+  "client": "stable",
+  "state": { "number": 2, "name": "play" },
+  "profile": { "name": "yoru" },
+  "beatmap": {
+    "id": 1234,
+    "set": 567,
+    "checksum": "fixture-checksum",
+    "mode": { "number": 0, "name": "osu" },
+    "artist": "Artist",
+    "title": "Title",
+    "mapper": "Mapper",
+    "version": "Insane",
+    "time": { "live": 60000, "firstObject": 10000, "lastObject": 110000, "mp3Length": 120000 },
+    "stats": { "maxCombo": 800 },
+    "futureField": true
+  },
+  "play": {
+    "failed": false,
+    "playerName": "yoru",
+    "mode": { "number": 0, "name": "osu" },
+    "score": 1234567,
+    "accuracy": 98.52,
+    "hits": { "300": 300, "100": 10, "50": 1, "0": 1, "geki": 0, "katu": 0 },
+    "combo": { "current": 420, "max": 500 },
+    "mods": { "name": "HDDT", "array": ["HD", { "acronym": "DT", "settings": { "speed_change": 1.5 } }] },
+    "rank": { "current": "A", "maxThisPlay": "S" },
+    "pp": { "current": 245.3, "fc": 310.2, "maxAchieved": 270.0, "maxAchievable": 330.0 }
+  },
+  "resultsScreen": {}
+}
