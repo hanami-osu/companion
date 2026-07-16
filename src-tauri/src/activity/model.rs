@@ -32,7 +32,7 @@ pub struct RecentPlay {
     pub rank: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResultObservation {
     pub score_id: Option<u64>,
     pub timestamp: Option<DateTime<Utc>>,
@@ -62,16 +62,28 @@ impl ResultObservation {
         self.score_id = newer.score_id.or(self.score_id);
         self.timestamp = newer.timestamp.or(self.timestamp);
         self.player_name = newer.player_name.or_else(|| self.player_name.take());
-        self.score = newer.score.or(self.score);
-        self.accuracy = newer.accuracy.or(self.accuracy);
-        self.combo = newer.combo.or(self.combo);
+        merge_meaningful(&mut self.score, newer.score, |value| *value > 0);
+        merge_meaningful(&mut self.accuracy, newer.accuracy, |value| *value > 0.0);
+        merge_meaningful(&mut self.combo, newer.combo, |value| *value > 0);
         self.misses = newer.misses.or(self.misses);
-        self.judged_objects = newer.judged_objects.or(self.judged_objects);
+        merge_meaningful(&mut self.judged_objects, newer.judged_objects, |value| {
+            *value > 0
+        });
         if !newer.mods.is_empty() {
             self.mods = newer.mods;
         }
-        self.pp = newer.pp.or(self.pp);
+        merge_meaningful(&mut self.pp, newer.pp, |value| *value > 0.0);
         self.rank = newer.rank.or_else(|| self.rank.take());
+    }
+}
+
+fn merge_meaningful<T>(
+    current: &mut Option<T>,
+    newer: Option<T>,
+    meaningful: impl FnOnce(&T) -> bool,
+) {
+    if newer.as_ref().is_some_and(meaningful) || current.is_none() && newer.is_some() {
+        *current = newer;
     }
 }
 

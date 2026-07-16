@@ -11,7 +11,8 @@ interface IdlePanelProps {
 }
 
 export function IdlePanel({ connection, osuRunning, beatmap }: IdlePanelProps) {
-    const heading = connection !== "connected" ? "Connect to tosu" : osuRunning ? "Waiting for a play" : "Ready for plays";
+    const heading =
+        connection !== "connected" ? "Connect to tosu" : osuRunning ? "Waiting for a play" : "Ready for plays";
     const copy =
         connection !== "connected"
             ? "Start tosu, then Companion will connect to its local v2 service automatically."
@@ -23,9 +24,16 @@ export function IdlePanel({ connection, osuRunning, beatmap }: IdlePanelProps) {
         <section className="animate-content-in py-5" aria-labelledby="idle-heading">
             {connection === "connected" && beatmap ? (
                 <div className="flex items-center gap-4">
-                    <BeatmapArtwork url={beatmap.backgroundUrl} alt={`${beatmap.artist} — ${beatmap.title}`} className="h-[76px] w-[76px] shrink-0 rounded-lg opacity-80" />
+                    <BeatmapArtwork
+                        url={beatmap.backgroundUrl}
+                        alt={`${beatmap.artist} — ${beatmap.title}`}
+                        retryKey={connection}
+                        className="h-[76px] w-[76px] shrink-0 rounded-lg opacity-80"
+                    />
                     <div className="min-w-0">
-                        <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-600">Selected beatmap</p>
+                        <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-600">
+                            Selected beatmap
+                        </p>
                         <h2 id="idle-heading" className="mt-1.5 truncate text-[15px] font-semibold text-zinc-100">
                             {beatmap.title}
                         </h2>

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::model::{PlayObservation, PlayOutcome, RecentPlay, ResultObservation};
@@ -7,7 +8,9 @@ use crate::app_state::{BeatmapSummary, CompanionMod, LivePlay, OsuState};
 const MIN_ACTIVE_SECONDS: f64 = 5.0;
 const MIN_JUDGED_OBJECTS: u64 = 10;
 const MIN_PROGRESS: f64 = 0.02;
-const MIN_RESULT_FRAMES: u8 = 2;
+const RESULT_GRACE_PERIOD: Duration = Duration::from_millis(400);
+const RESULT_SETTLE_PERIOD: Duration = Duration::from_millis(100);
+const RESULT_HARD_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 struct PlayCandidate {
@@ -23,7 +26,8 @@ struct PlayCandidate {
 struct PendingResults {
     candidate: PlayCandidate,
     result: Option<ResultObservation>,
-    observed_frames: u8,
+    first_seen_at: Instant,
+    last_updated_at: Instant,
 }
 
 #[derive(Default)]
@@ -41,19 +45,28 @@ impl PlayDetector {
     }
 
     pub fn observe(&mut self, observation: PlayObservation) -> Option<RecentPlay> {
+        self.observe_at(observation, Instant::now())
+    }
+
+    fn observe_at(&mut self, observation: PlayObservation, now: Instant) -> Option<RecentPlay> {
         match observation.state {
             OsuState::Gameplay => self.observe_gameplay(observation),
-            OsuState::Results => self.observe_results(observation.result),
+            OsuState::Results => self.observe_results(observation.result, now),
             _ => self.observe_away(),
         }
     }
 
     fn observe_gameplay(&mut self, observation: PlayObservation) -> Option<RecentPlay> {
-        self.pending_results = None;
+        let completed_result = self.take_pending_on_exit();
         let (Some(beatmap), Some(live)) = (observation.beatmap, observation.live) else {
-            return None;
+            return completed_result;
         };
         let mods = observation.mods;
+
+        if completed_result.is_some() {
+            self.active = Some(new_candidate(beatmap, live, mods));
+            return completed_result;
+        }
 
         if let Some(mut previous) = self.pending_exit.take() {
             let same = same_beatmap(&previous.beatmap, &beatmap);
@@ -103,29 +116,28 @@ impl PlayDetector {
         None
     }
 
-    fn observe_results(&mut self, result: Option<ResultObservation>) -> Option<RecentPlay> {
+    fn observe_results(
+        &mut self,
+        result: Option<ResultObservation>,
+        now: Instant,
+    ) -> Option<RecentPlay> {
         if let Some(pending) = self.pending_results.as_mut() {
-            pending.observed_frames = pending.observed_frames.saturating_add(1);
-            merge_result(&mut pending.result, result);
-            let ready = pending.observed_frames >= MIN_RESULT_FRAMES
-                && pending
-                    .result
-                    .as_ref()
-                    .is_some_and(ResultObservation::is_ready);
-            if ready {
+            if merge_result(&mut pending.result, result) {
+                pending.last_updated_at = now;
+            }
+            let age = now.duration_since(pending.first_seen_at);
+            let settled_for = now.duration_since(pending.last_updated_at);
+            let ready = pending
+                .result
+                .as_ref()
+                .is_some_and(ResultObservation::is_ready);
+            if age >= RESULT_HARD_TIMEOUT {
                 let pending = self.pending_results.take().expect("pending results");
-                let failed = pending.candidate.live.failed
-                    || pending
-                        .result
-                        .as_ref()
-                        .and_then(|value| value.rank.as_deref())
-                        .is_some_and(is_failure_rank);
-                let outcome = if failed {
-                    PlayOutcome::Failed
-                } else {
-                    PlayOutcome::Passed
-                };
-                return Some(build_recent(&pending.candidate, pending.result, outcome));
+                return finalize_pending(pending);
+            }
+            if ready && age >= RESULT_GRACE_PERIOD && settled_for >= RESULT_SETTLE_PERIOD {
+                let pending = self.pending_results.take().expect("pending results");
+                return finalize_pending(pending);
             }
             return None;
         }
@@ -137,13 +149,16 @@ impl PlayDetector {
         self.pending_results = Some(PendingResults {
             candidate,
             result,
-            observed_frames: 1,
+            first_seen_at: now,
+            last_updated_at: now,
         });
         None
     }
 
     fn observe_away(&mut self) -> Option<RecentPlay> {
-        self.pending_results = None;
+        if self.pending_results.is_some() {
+            return self.take_pending_on_exit();
+        }
         if let Some(previous) = self.pending_exit.take() {
             if !meaningful_attempt(&previous.live) {
                 return None;
@@ -158,6 +173,10 @@ impl PlayDetector {
 
         self.pending_exit = self.active.take();
         None
+    }
+
+    fn take_pending_on_exit(&mut self) -> Option<RecentPlay> {
+        self.pending_results.take().and_then(finalize_pending)
     }
 }
 
@@ -188,12 +207,37 @@ fn update_candidate(
     candidate.mods = mods;
 }
 
-fn merge_result(current: &mut Option<ResultObservation>, newer: Option<ResultObservation>) {
+fn merge_result(current: &mut Option<ResultObservation>, newer: Option<ResultObservation>) -> bool {
+    let before = current.clone();
     match (current.as_mut(), newer) {
         (Some(current), Some(newer)) => current.merge(newer),
         (None, Some(newer)) => *current = Some(newer),
         _ => {}
     }
+    *current != before
+}
+
+fn finalize_pending(pending: PendingResults) -> Option<RecentPlay> {
+    let failed = pending.candidate.live.failed
+        || pending
+            .result
+            .as_ref()
+            .and_then(|value| value.rank.as_deref())
+            .is_some_and(is_failure_rank);
+    let usable = failed
+        || pending
+            .result
+            .as_ref()
+            .is_some_and(ResultObservation::is_ready);
+    if !usable {
+        return None;
+    }
+    let outcome = if failed {
+        PlayOutcome::Failed
+    } else {
+        PlayOutcome::Passed
+    };
+    Some(build_recent(&pending.candidate, pending.result, outcome))
 }
 
 fn build_recent(
@@ -431,11 +475,61 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_results_are_not_saved_and_later_data_finalizes_once() {
+    fn ready_result_collects_late_pp_and_finalizes_once_after_grace_period() {
         let mut detector = PlayDetector::default();
-        detector.observe(observation(OsuState::Gameplay, 0.9));
+        let started = Instant::now();
+        detector.observe_at(observation(OsuState::Gameplay, 0.9), started);
         let mut first = observation(OsuState::Results, 0.9);
-        first.result = Some(ResultObservation {
+        let mut initial_result = ready_result();
+        initial_result.pp = None;
+        first.result = Some(initial_result);
+        assert!(detector.observe_at(first, started).is_none());
+
+        let mut complete = observation(OsuState::Results, 0.9);
+        complete.result = Some(ready_result());
+        assert!(
+            detector
+                .observe_at(complete.clone(), started + Duration::from_millis(250))
+                .is_none()
+        );
+        assert!(
+            detector
+                .observe_at(complete.clone(), started + Duration::from_millis(399))
+                .is_none()
+        );
+        let play = detector
+            .observe_at(complete.clone(), started + RESULT_GRACE_PERIOD)
+            .expect("complete result");
+        assert_eq!(play.score_id, Some(99));
+        assert_eq!(play.pp, Some(88.0));
+        assert_eq!(play.completion, None);
+        assert!(
+            detector
+                .observe_at(complete, started + Duration::from_millis(500))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn leaving_results_finalizes_ready_data_and_discards_unusable_data() {
+        let started = Instant::now();
+        let mut detector = PlayDetector::default();
+        detector.observe_at(observation(OsuState::Gameplay, 0.9), started);
+        let mut results = observation(OsuState::Results, 0.9);
+        results.result = Some(ready_result());
+        assert!(detector.observe_at(results, started).is_none());
+        let play = detector
+            .observe_at(
+                observation(OsuState::Menu, 0.9),
+                started + Duration::from_millis(50),
+            )
+            .expect("ready result on exit");
+        assert_eq!(play.outcome, PlayOutcome::Passed);
+
+        let mut detector = PlayDetector::default();
+        detector.observe_at(observation(OsuState::Gameplay, 0.9), started);
+        let mut unusable = observation(OsuState::Results, 0.9);
+        unusable.result = Some(ResultObservation {
             score_id: None,
             timestamp: None,
             player_name: None,
@@ -448,14 +542,44 @@ mod tests {
             pp: None,
             rank: None,
         });
-        assert!(detector.observe(first).is_none());
+        detector.observe_at(unusable, started);
+        assert!(
+            detector
+                .observe_at(
+                    observation(OsuState::Menu, 0.9),
+                    started + Duration::from_millis(50),
+                )
+                .is_none()
+        );
+    }
 
-        let mut complete = observation(OsuState::Results, 0.9);
-        complete.result = Some(ready_result());
-        let play = detector.observe(complete.clone()).expect("complete result");
-        assert_eq!(play.score_id, Some(99));
-        assert_eq!(play.completion, None);
-        assert!(detector.observe(complete).is_none());
+    #[test]
+    fn hard_timeout_uses_reliable_failed_data_and_discards_unknown_results() {
+        let started = Instant::now();
+        let mut failed_gameplay = observation(OsuState::Gameplay, 0.9);
+        failed_gameplay.live.as_mut().expect("live").failed = true;
+        let mut detector = PlayDetector::default();
+        detector.observe_at(failed_gameplay, started);
+        detector.observe_at(observation(OsuState::Results, 0.9), started);
+        let failed = detector
+            .observe_at(
+                observation(OsuState::Results, 0.9),
+                started + RESULT_HARD_TIMEOUT,
+            )
+            .expect("reliable failure");
+        assert_eq!(failed.outcome, PlayOutcome::Failed);
+
+        let mut detector = PlayDetector::default();
+        detector.observe_at(observation(OsuState::Gameplay, 0.9), started);
+        detector.observe_at(observation(OsuState::Results, 0.9), started);
+        assert!(
+            detector
+                .observe_at(
+                    observation(OsuState::Results, 0.9),
+                    started + RESULT_HARD_TIMEOUT,
+                )
+                .is_none()
+        );
     }
 
     #[test]

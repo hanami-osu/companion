@@ -9,6 +9,41 @@ use crate::{
     tosu::process::{MemoryAccessError, TosuMemoryAccess, TosuProcess},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TosuLaunchDecision {
+    Spawn,
+    ExternalEndpoint,
+    TrackingPaused,
+    CompanionOwned,
+    ConnectionInProgress,
+    MissingExecutable,
+}
+
+fn decide_tosu_launch(
+    tracking_enabled: bool,
+    connection: &TosuConnection,
+    process_owned: bool,
+    executable_available: bool,
+    endpoint_reachable: bool,
+) -> TosuLaunchDecision {
+    if !tracking_enabled {
+        TosuLaunchDecision::TrackingPaused
+    } else if process_owned {
+        TosuLaunchDecision::CompanionOwned
+    } else if endpoint_reachable {
+        TosuLaunchDecision::ExternalEndpoint
+    } else if matches!(
+        connection,
+        TosuConnection::Connected | TosuConnection::Connecting | TosuConnection::Stale
+    ) {
+        TosuLaunchDecision::ConnectionInProgress
+    } else if !executable_available {
+        TosuLaunchDecision::MissingExecutable
+    } else {
+        TosuLaunchDecision::Spawn
+    }
+}
+
 #[tauri::command]
 pub async fn get_snapshot(app: AppHandle) -> CompanionSnapshot {
     current_snapshot(&app).await
@@ -125,18 +160,60 @@ pub async fn launch_tosu(app: AppHandle) -> Result<(), String> {
 
 pub async fn launch_tosu_impl(app: &AppHandle) -> Result<(), String> {
     let snapshot = current_snapshot(app).await;
-    if !snapshot.tracking_enabled {
-        return Err(
-            "Resume tracking before launching tosu so Companion can detect an existing process"
-                .into(),
-        );
-    }
-    if matches!(
-        snapshot.tosu.connection,
-        TosuConnection::Connected | TosuConnection::Connecting | TosuConnection::Stale
-    ) && !snapshot.tosu.process_owned
-    {
-        return Err("tosu is already running outside Companion".into());
+    let (endpoint, process_owned, executable_available) = {
+        let state = app.state::<AppState>();
+        let endpoint = state
+            .settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .endpoint();
+        let mut process = state
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (
+            endpoint,
+            process.is_owned(),
+            process.resolved_executable().is_some(),
+        )
+    };
+    let endpoint_reachable = tokio::time::timeout(
+        Duration::from_millis(350),
+        tokio::net::TcpStream::connect(endpoint.socket_addr()),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+
+    match decide_tosu_launch(
+        snapshot.tracking_enabled,
+        &snapshot.tosu.connection,
+        process_owned,
+        executable_available,
+        endpoint_reachable,
+    ) {
+        TosuLaunchDecision::ExternalEndpoint => {
+            update_snapshot(app, |snapshot| {
+                snapshot.tosu.process_owned = false;
+                snapshot.tosu.connection = TosuConnection::Connecting;
+                snapshot.tosu.message =
+                    Some("Found an externally managed tosu service; connecting".into());
+            })
+            .await;
+            return Ok(());
+        }
+        TosuLaunchDecision::TrackingPaused => {
+            return Err("Resume tracking before launching tosu".into());
+        }
+        TosuLaunchDecision::CompanionOwned => {
+            return Err("Companion already owns the running tosu process".into());
+        }
+        TosuLaunchDecision::ConnectionInProgress => {
+            return Err("Companion is already connecting or reconnecting to tosu".into());
+        }
+        TosuLaunchDecision::MissingExecutable => {
+            return Err("Select the tosu executable before launching it".into());
+        }
+        TosuLaunchDecision::Spawn => {}
     }
 
     let (result, memory_access) = {
@@ -181,6 +258,53 @@ pub async fn launch_tosu_impl(app: &AppHandle) -> Result<(), String> {
             })
             .await;
             Err(message)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_decision_prefers_reachable_external_service() {
+        assert_eq!(
+            decide_tosu_launch(true, &TosuConnection::Unavailable, false, true, true),
+            TosuLaunchDecision::ExternalEndpoint
+        );
+    }
+
+    #[test]
+    fn launch_decision_requires_tracking_and_an_executable() {
+        assert_eq!(
+            decide_tosu_launch(false, &TosuConnection::Disabled, false, true, false),
+            TosuLaunchDecision::TrackingPaused
+        );
+        assert_eq!(
+            decide_tosu_launch(true, &TosuConnection::Unavailable, false, false, false),
+            TosuLaunchDecision::MissingExecutable
+        );
+        assert_eq!(
+            decide_tosu_launch(true, &TosuConnection::Unavailable, false, true, false),
+            TosuLaunchDecision::Spawn
+        );
+    }
+
+    #[test]
+    fn launch_decision_never_spawns_over_owned_or_in_progress_instances() {
+        assert_eq!(
+            decide_tosu_launch(true, &TosuConnection::Unavailable, true, true, false),
+            TosuLaunchDecision::CompanionOwned
+        );
+        for connection in [
+            TosuConnection::Connecting,
+            TosuConnection::Connected,
+            TosuConnection::Stale,
+        ] {
+            assert_eq!(
+                decide_tosu_launch(true, &connection, false, true, false),
+                TosuLaunchDecision::ConnectionInProgress
+            );
         }
     }
 }

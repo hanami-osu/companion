@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode, header::HeaderValue};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -46,12 +46,39 @@ pub enum AuthClientError {
     InvalidUrl,
     #[error("could not reach Hanami")]
     Network,
-    #[error("Hanami rejected the OAuth request")]
-    Rejected,
+    #[error("the Hanami authorization grant is invalid or revoked")]
+    InvalidGrant,
+    #[error("Hanami rate limited the request")]
+    RateLimited { retry_after: Option<Duration> },
+    #[error("Hanami is temporarily unavailable (HTTP {status})")]
+    ServerUnavailable { status: u16 },
+    #[error("Hanami returned an unexpected HTTP status ({status})")]
+    UnexpectedStatus { status: u16 },
     #[error("Hanami returned an invalid token response")]
     InvalidResponse,
     #[error("Hanami did not rotate the refresh token")]
     MissingRefreshToken,
+}
+
+impl AuthClientError {
+    pub fn is_temporary(&self) -> bool {
+        matches!(
+            self,
+            Self::Network
+                | Self::RateLimited { .. }
+                | Self::ServerUnavailable { .. }
+                | Self::UnexpectedStatus { .. }
+                | Self::InvalidResponse
+                | Self::MissingRefreshToken
+        )
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,8 +190,27 @@ impl HanamiClient {
             .send()
             .await
             .map_err(|_| AuthClientError::Network)?;
-        if !response.status().is_success() {
-            return Err(AuthClientError::Rejected);
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
+            if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                return Err(classify_oauth_failure(status, retry_after.as_ref(), &[]));
+            }
+            let body = if response
+                .content_length()
+                .is_some_and(|length| length > 16 * 1024)
+            {
+                Vec::new()
+            } else {
+                response
+                    .bytes()
+                    .await
+                    .map_or_else(|_| Vec::new(), |bytes| bytes.to_vec())
+            };
+            return Err(classify_oauth_failure(status, retry_after.as_ref(), &body));
         }
         let bytes = response
             .bytes()
@@ -184,7 +230,45 @@ impl HanamiClient {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(AuthClientError::Rejected)
+            let status = response.status();
+            let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+            Err(classify_oauth_failure(status, retry_after, &[]))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OAuthErrorResponse {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn classify_oauth_failure(
+    status: StatusCode,
+    retry_after: Option<&HeaderValue>,
+    body: &[u8],
+) -> AuthClientError {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = retry_after
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|seconds| Duration::from_secs(seconds.min(300)));
+        return AuthClientError::RateLimited { retry_after };
+    }
+    if status.is_server_error() {
+        return AuthClientError::ServerUnavailable {
+            status: status.as_u16(),
+        };
+    }
+    let invalid_grant = serde_json::from_slice::<OAuthErrorResponse>(body)
+        .ok()
+        .and_then(|response| response.error)
+        .is_some_and(|error| error.eq_ignore_ascii_case("invalid_grant"));
+    if invalid_grant {
+        AuthClientError::InvalidGrant
+    } else {
+        AuthClientError::UnexpectedStatus {
+            status: status.as_u16(),
         }
     }
 }
@@ -262,5 +346,52 @@ mod tests {
     fn rejects_empty_or_malformed_token_responses() {
         assert!(parse_token_response(br#"{"access_token":"","expires_in":3600}"#).is_err());
         assert!(parse_token_response(br#"{"access_token":"access"}"#).is_err());
+    }
+
+    #[test]
+    fn classifies_only_invalid_grant_as_permanent() {
+        assert!(matches!(
+            classify_oauth_failure(
+                StatusCode::BAD_REQUEST,
+                None,
+                br#"{"error":"invalid_grant"}"#,
+            ),
+            AuthClientError::InvalidGrant
+        ));
+        assert!(matches!(
+            classify_oauth_failure(
+                StatusCode::BAD_REQUEST,
+                None,
+                br#"{"error":"invalid_request"}"#,
+            ),
+            AuthClientError::UnexpectedStatus { status: 400 }
+        ));
+    }
+
+    #[test]
+    fn classifies_rate_limits_and_server_failures_as_temporary() {
+        let retry_after = HeaderValue::from_static("12");
+        let rate_limited =
+            classify_oauth_failure(StatusCode::TOO_MANY_REQUESTS, Some(&retry_after), &[]);
+        assert!(rate_limited.is_temporary());
+        assert_eq!(rate_limited.retry_after(), Some(Duration::from_secs(12)));
+
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let error = classify_oauth_failure(status, None, &[]);
+            assert!(matches!(error, AuthClientError::ServerUnavailable { .. }));
+            assert!(error.is_temporary());
+        }
+    }
+
+    #[test]
+    fn malformed_success_is_not_an_invalid_grant() {
+        let error = parse_token_response(br#"{"access_token":"access","expires_in":"soon"}"#)
+            .expect_err("malformed response");
+        assert!(matches!(error, AuthClientError::InvalidResponse));
+        assert!(error.is_temporary());
     }
 }

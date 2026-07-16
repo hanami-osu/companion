@@ -175,6 +175,7 @@ pub struct CompanionSnapshot {
     pub live_play: Option<LivePlay>,
     pub recent_activity: Vec<crate::activity::model::RecentPlay>,
     pub auth: AuthStatus,
+    pub settings_warning: Option<String>,
     pub app_version: String,
     pub upload_available: bool,
 }
@@ -196,6 +197,7 @@ impl AppState {
         let (tracking, _) = watch::channel(true);
         let auth_config = AuthConfig::from_environment();
         let endpoint = settings.endpoint();
+        let settings_warning = settings.warning();
         let process = TosuProcess::new(settings.executable());
         let resolved_executable = process.resolved_executable();
         let executable_available = resolved_executable.is_some();
@@ -227,6 +229,7 @@ impl AppState {
                     base_url: auth_config.base_url().to_owned(),
                     is_production: auth_config.is_production(),
                 },
+                settings_warning,
                 app_version: env!("CARGO_PKG_VERSION").to_owned(),
                 upload_available: false,
             }),
@@ -295,6 +298,7 @@ mod tests {
                 base_url: "https://hanami.yorunoken.com".into(),
                 is_production: true,
             },
+            settings_warning: None,
             app_version: "0.1.0".into(),
             upload_available: false,
         };
@@ -309,6 +313,7 @@ mod tests {
             "livePlay",
             "recentActivity",
             "auth",
+            "settingsWarning",
             "appVersion",
             "uploadAvailable",
         ] {

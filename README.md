@@ -42,6 +42,7 @@ bun run tauri dev
 Useful checks:
 
 ```bash
+bun run format:check
 bun run build
 bun run lint
 bun run test
@@ -51,6 +52,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 bunx tauri build
 ```
 
+Run `bun run format` to apply Prettier to the frontend and repository configuration files. `bun run check`
+runs the formatting check, linting, frontend tests, and production frontend build together.
+
 Release builds use the production Hanami URL, `https://hanami.yorunoken.com`. Debug builds, including `bun run tauri dev`, use `http://localhost:3000` so they can authenticate against a locally running Hanami Web server. Set `HANAMI_BASE_URL` to override either default. The active non-production URL is shown in Settings.
 
 ## Authentication and local data
@@ -59,7 +63,7 @@ Sign-in opens `/oauth/authorize` in the system browser and returns to a temporar
 
 Recent plays are held in memory and disappear when Companion exits. The storage boundary is intentionally replaceable, but this prototype does not add a database.
 
-The play detector abandons its current candidate whenever tracking or the tosu observation stream is discontinuous. An attempt becomes recordable after five seconds of active gameplay, ten judged objects, or two percent beatmap progress. Results wait for a later complete frame before being finalized, and every local attempt receives a UUID with separate start and end timestamps.
+The play detector abandons its current candidate whenever tracking or the tosu observation stream is discontinuous. An attempt becomes recordable after five seconds of active gameplay, ten judged objects, or two percent beatmap progress. Results collect updates for at least 400 ms and use a 1.5 second hard timeout before finalizing the best reliable data. Every local attempt receives a UUID with separate start and end timestamps.
 
 At startup, stored sessions are restored with bounded exponential retry for temporary network failures. Rejected refresh tokens are deleted. Logout always clears local credentials and in-memory access first even when remote revocation cannot be confirmed.
 
@@ -70,3 +74,7 @@ Rust and TypeScript snapshot models remain intentionally small and manually mirr
 Closing the main window hides it while tracking continues. The tray menu can reopen the window, enable or disable tracking, launch tosu, stop a Companion-owned tosu process, sign out, and quit cleanly. Disabling tracking only closes Companion's connection. An externally launched tosu process is never terminated by Companion.
 
 The tosu socket, dashboard, and artwork endpoints are derived from one loopback configuration. Port `24050` is the current default and the persisted configuration model accepts a different port when editing it is added to the UI. A production Content Security Policy allows packaged application assets, Tauri IPC, and artwork from the local tosu HTTP endpoint; it does not permit remote scripts.
+
+New installations do not launch tosu automatically. The **Launch tosu with Companion** setting must be enabled explicitly after the user understands the local dependency. Existing settings files keep an explicit value, and legacy files created before the setting was stored retain the previous enabled behavior for compatibility.
+
+The packaged CSP permits images from loopback HTTP ports because the tosu port is persisted at runtime while Tauri's production CSP is generated statically at build time. Access remains limited to `127.0.0.1`; arbitrary remote image, script, and connection origins are not allowed.

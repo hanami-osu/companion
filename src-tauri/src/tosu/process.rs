@@ -84,6 +84,7 @@ impl ProcessOwnership {
 struct OwnedProcess {
     child: Child,
     memory_failure_observed: Arc<AtomicBool>,
+    compatibility_failure_observed: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -156,22 +157,36 @@ impl TosuProcess {
         let executable =
             resolve_from(self.configured_path.as_deref()).ok_or(ProcessError::NotInstalled)?;
         let mut command = Command::new(&executable);
-        command.stdin(Stdio::null()).stdout(Stdio::null());
+        command.stdin(Stdio::null());
         #[cfg(target_os = "linux")]
-        command.stderr(Stdio::piped());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(not(target_os = "linux"))]
-        command.stderr(Stdio::null());
+        command.stdout(Stdio::null()).stderr(Stdio::null());
 
         let mut child = command.spawn()?;
         let memory_failure_observed = Arc::new(AtomicBool::new(false));
+        let compatibility_failure_observed = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        if let Some(stdout) = child.stdout.take() {
+            watch_tosu_output(
+                stdout,
+                Arc::clone(&memory_failure_observed),
+                Arc::clone(&compatibility_failure_observed),
+            );
+        }
         #[cfg(target_os = "linux")]
         if let Some(stderr) = child.stderr.take() {
-            watch_memory_access_errors(stderr, Arc::clone(&memory_failure_observed));
+            watch_tosu_output(
+                stderr,
+                Arc::clone(&memory_failure_observed),
+                Arc::clone(&compatibility_failure_observed),
+            );
         }
 
         self.owned = Some(OwnedProcess {
             child,
             memory_failure_observed,
+            compatibility_failure_observed,
         });
         Ok(executable)
     }
@@ -181,6 +196,13 @@ impl TosuProcess {
         self.owned
             .as_ref()
             .is_some_and(|owned| owned.memory_failure_observed.load(Ordering::Relaxed))
+    }
+
+    pub fn compatibility_failure_observed(&mut self) -> bool {
+        self.refresh();
+        self.owned
+            .as_ref()
+            .is_some_and(|owned| owned.compatibility_failure_observed.load(Ordering::Relaxed))
     }
 
     pub fn refresh(&mut self) -> bool {
@@ -318,14 +340,45 @@ fn resolve_capability_target(configured: Option<&Path>) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn watch_memory_access_errors(stderr: std::process::ChildStderr, observed: Arc<AtomicBool>) {
+fn watch_tosu_output<R>(
+    output: R,
+    memory_failure_observed: Arc<AtomicBool>,
+    compatibility_failure_observed: Arc<AtomicBool>,
+) where
+    R: Read + Send + 'static,
+{
     std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if indicates_memory_access_failure(&line) {
-                observed.store(true, Ordering::Relaxed);
-            }
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            apply_tosu_output_line(
+                &line,
+                &memory_failure_observed,
+                &compatibility_failure_observed,
+            );
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn apply_tosu_output_line(
+    line: &str,
+    memory_failure_observed: &AtomicBool,
+    compatibility_failure_observed: &AtomicBool,
+) {
+    let normalized = line.to_ascii_lowercase();
+    if normalized.contains("client process") && normalized.contains("has terminated") {
+        memory_failure_observed.store(false, Ordering::Relaxed);
+        compatibility_failure_observed.store(false, Ordering::Relaxed);
+        return;
+    }
+    if normalized.contains("successfully retrieved offsets for version") {
+        compatibility_failure_observed.store(false, Ordering::Relaxed);
+    }
+    if indicates_memory_access_failure(&normalized) {
+        memory_failure_observed.store(true, Ordering::Relaxed);
+    }
+    if indicates_compatibility_failure(&normalized) {
+        compatibility_failure_observed.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -334,6 +387,14 @@ fn indicates_memory_access_failure(line: &str) -> bool {
     line.contains("failed to read address")
         || line.contains("cap_sys_ptrace")
         || line.contains("ptrace") && line.contains("permission")
+}
+
+#[cfg(target_os = "linux")]
+fn indicates_compatibility_failure(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("failed to fetch offsets for")
+        || line.contains("offsets not found for osu! version")
+        || line.contains("unable to find osu! version")
 }
 
 #[cfg(target_os = "linux")]
@@ -441,5 +502,72 @@ exec /opt/tosu/tosu --update=false "$@"
         assert!(!indicates_memory_access_failure(
             "Searching for osu! process..."
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recognizes_only_terminal_lazer_compatibility_failures() {
+        assert!(indicates_compatibility_failure(
+            "Failed to fetch offsets for 2026.716.0, report to devs"
+        ));
+        assert!(indicates_compatibility_failure(
+            "Offsets not found for osu! version 2026.716.0"
+        ));
+        assert!(indicates_compatibility_failure(
+            "Unable to find osu! version for lazer 123"
+        ));
+        assert!(!indicates_compatibility_failure(
+            "Failed to fetch offsets from osuck.net: 500 Internal Server Error"
+        ));
+        assert!(!indicates_compatibility_failure(
+            "Successfully retrieved offsets for version 2026.716.0"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_termination_clears_runtime_failures() {
+        let memory_failure = AtomicBool::new(false);
+        let compatibility_failure = AtomicBool::new(false);
+        apply_tosu_output_line(
+            "failed to read address 40000000 of size 600000",
+            &memory_failure,
+            &compatibility_failure,
+        );
+        apply_tosu_output_line(
+            "Failed to fetch offsets for 2026.716.0, report to devs",
+            &memory_failure,
+            &compatibility_failure,
+        );
+        assert!(memory_failure.load(Ordering::Relaxed));
+        assert!(compatibility_failure.load(Ordering::Relaxed));
+
+        apply_tosu_output_line(
+            "Client process lazer has terminated",
+            &memory_failure,
+            &compatibility_failure,
+        );
+        assert!(!memory_failure.load(Ordering::Relaxed));
+        assert!(!compatibility_failure.load(Ordering::Relaxed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn successful_offset_fetch_clears_a_previous_compatibility_failure() {
+        let memory_failure = AtomicBool::new(false);
+        let compatibility_failure = AtomicBool::new(false);
+        apply_tosu_output_line(
+            "Failed to fetch offsets for 2026.716.0, report to devs",
+            &memory_failure,
+            &compatibility_failure,
+        );
+        assert!(compatibility_failure.load(Ordering::Relaxed));
+
+        apply_tosu_output_line(
+            "Successfully retrieved offsets for version 2026.716.0",
+            &memory_failure,
+            &compatibility_failure,
+        );
+        assert!(!compatibility_failure.load(Ordering::Relaxed));
     }
 }

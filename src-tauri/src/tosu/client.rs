@@ -19,6 +19,7 @@ const UI_INTERVAL: Duration = Duration::from_millis(125);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_ACTIVITY_SILENCE: Duration = Duration::from_secs(15);
 const MAX_VALID_STATE_SILENCE: Duration = Duration::from_secs(10);
+const UNSUPPORTED_OSU_MESSAGE: &str = "tosu does not support this osu! version yet; update or restart tosu after compatible offsets are available";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorEnd {
@@ -234,16 +235,28 @@ where
                                 idle_state_applied = false;
                                 consecutive_unexpected = 0;
                                 let normalized = raw.normalize(endpoint);
-                                let recent = activity.observe(normalized.observation);
+                                let compatibility_failure = owned_tosu_compatibility_failure(app);
+                                let recent = if compatibility_failure {
+                                    activity.reset();
+                                    Vec::new()
+                                } else {
+                                    activity.observe(normalized.observation)
+                                };
                                 {
                                     let state = app.state::<AppState>();
                                     let mut snapshot = state.snapshot.write().await;
-                                    snapshot.tosu.connection = TosuConnection::Connected;
-                                    snapshot.tosu.message = None;
-                                    snapshot.osu = normalized.osu;
-                                    snapshot.now_playing = normalized.now_playing;
-                                    snapshot.live_play = normalized.live_play;
-                                    snapshot.recent_activity = recent;
+                                    if compatibility_failure {
+                                        snapshot.tosu.connection = TosuConnection::Error;
+                                        snapshot.tosu.message = Some(UNSUPPORTED_OSU_MESSAGE.into());
+                                        clear_displayed_osu_state(&mut snapshot);
+                                    } else {
+                                        snapshot.tosu.connection = TosuConnection::Connected;
+                                        snapshot.tosu.message = None;
+                                        snapshot.osu = normalized.osu;
+                                        snapshot.now_playing = normalized.now_playing;
+                                        snapshot.live_play = normalized.live_play;
+                                        snapshot.recent_activity = recent;
+                                    }
                                 }
                                 if last_ui_emit.elapsed() >= UI_INTERVAL {
                                     emit_current(app).await;
@@ -311,7 +324,7 @@ async fn emit_current(app: &AppHandle) {
 }
 
 async fn refresh_process_state(app: &AppHandle) {
-    let (owned, executable, executable_configured, memory_access) = {
+    let (owned, executable, executable_configured, memory_access, compatibility_failure) = {
         let state = app.state::<AppState>();
         let mut process = state
             .process
@@ -324,7 +337,14 @@ async fn refresh_process_state(app: &AppHandle) {
         if process.memory_failure_observed() && memory_access != TosuMemoryAccess::Available {
             memory_access = TosuMemoryAccess::PossiblyRequired;
         }
-        (owned, executable, executable_configured, memory_access)
+        let compatibility_failure = process.compatibility_failure_observed();
+        (
+            owned,
+            executable,
+            executable_configured,
+            memory_access,
+            compatibility_failure,
+        )
     };
     let current = current_snapshot(app).await;
     let executable_path = executable
@@ -335,6 +355,9 @@ async fn refresh_process_state(app: &AppHandle) {
         || current.tosu.executable_path != executable_path
         || current.tosu.executable_configured != executable_configured
         || current.tosu.memory_access != memory_access
+        || compatibility_failure
+            && (current.tosu.connection != TosuConnection::Error
+                || current.tosu.message.as_deref() != Some(UNSUPPORTED_OSU_MESSAGE))
     {
         update_snapshot(app, |snapshot| {
             snapshot.tosu.process_owned = owned;
@@ -342,9 +365,22 @@ async fn refresh_process_state(app: &AppHandle) {
             snapshot.tosu.executable_path = executable_path;
             snapshot.tosu.executable_configured = executable_configured;
             snapshot.tosu.memory_access = memory_access;
+            if compatibility_failure {
+                snapshot.tosu.connection = TosuConnection::Error;
+                snapshot.tosu.message = Some(UNSUPPORTED_OSU_MESSAGE.into());
+                clear_displayed_osu_state(snapshot);
+            }
         })
         .await;
     }
+}
+
+fn owned_tosu_compatibility_failure(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .process
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .compatibility_failure_observed()
 }
 
 async fn set_connection(app: &AppHandle, connection: TosuConnection, message: Option<String>) {

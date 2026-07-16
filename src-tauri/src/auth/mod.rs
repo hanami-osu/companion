@@ -47,8 +47,20 @@ impl AuthError {
             Self::Client(AuthClientError::Network) => {
                 "Hanami could not be reached. The stored session will be retried.".into()
             }
-            Self::Client(AuthClientError::Rejected) => {
+            Self::Client(AuthClientError::InvalidGrant) => {
                 "The stored Hanami session is no longer valid.".into()
+            }
+            Self::Client(AuthClientError::RateLimited { .. }) => {
+                "Hanami is busy. Session restoration will retry shortly.".into()
+            }
+            Self::Client(AuthClientError::ServerUnavailable { .. }) => {
+                "Hanami is temporarily unavailable. Session restoration will retry.".into()
+            }
+            Self::Client(AuthClientError::UnexpectedStatus { status }) => {
+                format!("Hanami returned HTTP {status}. The stored session was preserved.")
+            }
+            Self::Client(AuthClientError::InvalidResponse) => {
+                "Hanami returned an invalid response. The stored session was preserved.".into()
             }
             Self::Client(_) => "Hanami could not complete authentication.".into(),
             Self::CredentialStore(_) => {
@@ -62,8 +74,8 @@ impl AuthError {
 enum RefreshOutcome {
     Restored,
     NoSession,
-    TemporaryFailure,
-    Rejected,
+    TemporaryFailure { retry_after: Option<Duration> },
+    InvalidGrant,
     CredentialStoreUnavailable,
 }
 
@@ -153,12 +165,16 @@ impl AuthRuntime {
         self.refresh_available = true;
         let response = match self.client.refresh(&refresh).await {
             Ok(response) => response,
-            Err(AuthClientError::Network) => return Ok(RefreshOutcome::TemporaryFailure),
-            Err(AuthClientError::Rejected) => {
+            Err(AuthClientError::InvalidGrant) => {
                 self.access = None;
                 self.refresh_available = false;
                 self.store.delete()?;
-                return Ok(RefreshOutcome::Rejected);
+                return Ok(RefreshOutcome::InvalidGrant);
+            }
+            Err(error) if error.is_temporary() => {
+                return Ok(RefreshOutcome::TemporaryFailure {
+                    retry_after: error.retry_after(),
+                });
             }
             Err(error) => return Err(error.into()),
         };
@@ -341,9 +357,12 @@ pub fn start_supervisor(app: AppHandle) {
                     backoff.reset();
                     delay = Duration::from_secs(30);
                 }
-                RefreshOutcome::TemporaryFailure => delay = backoff.take(),
+                RefreshOutcome::TemporaryFailure { retry_after } => {
+                    let backoff_delay = backoff.take();
+                    delay = retry_after.map_or(backoff_delay, |value| value.max(backoff_delay));
+                }
                 RefreshOutcome::NoSession
-                | RefreshOutcome::Rejected
+                | RefreshOutcome::InvalidGrant
                 | RefreshOutcome::CredentialStoreUnavailable => {
                     backoff.reset();
                     delay = Duration::from_secs(30);
@@ -369,16 +388,16 @@ async fn refresh_session(app: &AppHandle) -> RefreshOutcome {
             set_auth_state(app, AuthState::SignedIn, Some("Connected to Hanami".into())).await;
             RefreshOutcome::Restored
         }
-        Ok(RefreshOutcome::TemporaryFailure) => {
+        Ok(outcome @ RefreshOutcome::TemporaryFailure { .. }) => {
             set_auth_state(
                 app,
                 AuthState::Error,
                 Some("Hanami is temporarily unreachable. Session restoration will retry.".into()),
             )
             .await;
-            RefreshOutcome::TemporaryFailure
+            outcome
         }
-        Ok(outcome @ (RefreshOutcome::Rejected | RefreshOutcome::NoSession)) => {
+        Ok(outcome @ (RefreshOutcome::InvalidGrant | RefreshOutcome::NoSession)) => {
             set_auth_state(app, AuthState::SignedOut, None).await;
             outcome
         }
@@ -396,7 +415,7 @@ async fn refresh_session(app: &AppHandle) -> RefreshOutcome {
         }
         Err(error) => {
             set_auth_state(app, AuthState::Error, Some(error.user_message())).await;
-            RefreshOutcome::TemporaryFailure
+            RefreshOutcome::TemporaryFailure { retry_after: None }
         }
     }
 }
@@ -543,13 +562,17 @@ mod tests {
 
     #[tokio::test]
     async fn restoration_retries_after_a_temporary_network_failure() {
-        let (mut runtime, _) = runtime(
+        let (mut runtime, stored) = runtime(
             vec![Err(AuthClientError::Network), Ok(token("rotated"))],
             Ok(()),
         );
         assert_eq!(
             runtime.refresh().await.expect("temporary"),
-            RefreshOutcome::TemporaryFailure
+            RefreshOutcome::TemporaryFailure { retry_after: None }
+        );
+        assert_eq!(
+            stored.lock().expect("store").as_deref(),
+            Some("stored-refresh")
         );
         assert!(runtime.should_refresh());
         assert_eq!(
@@ -561,13 +584,43 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_refresh_clears_the_stored_session() {
-        let (mut runtime, stored) = runtime(vec![Err(AuthClientError::Rejected)], Ok(()));
+        let (mut runtime, stored) = runtime(vec![Err(AuthClientError::InvalidGrant)], Ok(()));
         assert_eq!(
             runtime.refresh().await.expect("rejected"),
-            RefreshOutcome::Rejected
+            RefreshOutcome::InvalidGrant
         );
         assert!(stored.lock().expect("store").is_none());
         assert!(!runtime.refresh_available);
+    }
+
+    #[tokio::test]
+    async fn temporary_http_and_response_failures_preserve_the_stored_session() {
+        let failures = [
+            AuthClientError::RateLimited {
+                retry_after: Some(Duration::from_secs(10)),
+            },
+            AuthClientError::ServerUnavailable { status: 500 },
+            AuthClientError::ServerUnavailable { status: 502 },
+            AuthClientError::ServerUnavailable { status: 503 },
+            AuthClientError::InvalidResponse,
+        ];
+
+        for failure in failures {
+            let expected_retry_after = failure.retry_after();
+            let (mut runtime, stored) = runtime(vec![Err(failure)], Ok(()));
+            assert_eq!(
+                runtime.refresh().await.expect("temporary failure"),
+                RefreshOutcome::TemporaryFailure {
+                    retry_after: expected_retry_after,
+                }
+            );
+            assert_eq!(
+                stored.lock().expect("store").as_deref(),
+                Some("stored-refresh")
+            );
+            assert!(runtime.refresh_available);
+            assert!(runtime.should_refresh());
+        }
     }
 
     #[tokio::test]

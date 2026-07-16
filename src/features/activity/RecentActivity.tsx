@@ -28,7 +28,9 @@ export function RecentActivity({ plays }: RecentActivityProps) {
                                 </p>
                                 <p className="mt-1 truncate text-[10px] text-zinc-600">
                                     {play.outcome !== "passed" && play.completion != null && (
-                                        <span className="tabular-nums text-zinc-500">{formatCompletion(play.completion)} complete · </span>
+                                        <span className="tabular-nums text-zinc-500">
+                                            {formatCompletion(play.completion)} complete ·{" "}
+                                        </span>
                                     )}
                                     <span>
                                         {play.accuracy.toFixed(2)}% · {play.combo}× · {formatMisses(play.misses)}
@@ -37,7 +39,9 @@ export function RecentActivity({ plays }: RecentActivityProps) {
                                 </p>
                             </div>
                             <div className="text-right">
-                                <p className="text-[11px] font-semibold tabular-nums text-zinc-300">{play.pp == null ? "—" : `${Math.round(play.pp)} pp`}</p>
+                                <p className="text-[11px] font-semibold tabular-nums text-zinc-300">
+                                    {play.pp == null ? "—" : `${Math.round(play.pp)} pp`}
+                                </p>
                                 <time dateTime={play.endedAt} className="mt-1 block text-[9px] text-zinc-700">
                                     {formatTime(play.endedAt)}
                                 </time>
@@ -78,5 +82,7 @@ function outcomeTone(outcome: RecentPlay["outcome"]) {
 
 function formatTime(timestamp: string) {
     const date = new Date(timestamp);
-    return Number.isNaN(date.getTime()) ? "just now" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return Number.isNaN(date.getTime())
+        ? "just now"
+        : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }

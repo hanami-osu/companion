@@ -25,6 +25,7 @@ struct TrayState {
     tracking_enabled: bool,
     connection: TosuConnection,
     process_owned: bool,
+    executable_available: bool,
     signed_in: bool,
     memory_access: TosuMemoryAccess,
 }
@@ -35,6 +36,7 @@ impl TrayState {
             tracking_enabled: snapshot.tracking_enabled,
             connection: snapshot.tosu.connection.clone(),
             process_owned: snapshot.tosu.process_owned,
+            executable_available: snapshot.tosu.executable_available,
             signed_in: matches!(
                 snapshot.auth.state,
                 AuthState::SignedIn | AuthState::Refreshing
@@ -183,7 +185,8 @@ pub fn sync_menu(app: &AppHandle, snapshot: &CompanionSnapshot) {
                 next.connection,
                 TosuConnection::Connected | TosuConnection::Connecting | TosuConnection::Stale
             )
-            && !next.process_owned,
+            && !next.process_owned
+            && next.executable_available,
     );
     let _ = menu.stop_tosu.set_enabled(next.process_owned);
     let _ = menu.sign_out.set_enabled(next.signed_in);
@@ -228,6 +231,7 @@ mod tests {
                 base_url: "https://hanami.yorunoken.com".into(),
                 is_production: true,
             },
+            settings_warning: None,
             app_version: "0.1.0".into(),
             upload_available: false,
         }
