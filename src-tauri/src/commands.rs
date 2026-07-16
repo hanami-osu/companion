@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     app_state::{AppState, CompanionSnapshot, TosuConnection, current_snapshot, update_snapshot},
@@ -26,9 +29,93 @@ pub async fn set_tracking_enabled_impl(app: &AppHandle, enabled: bool) -> Result
             TosuConnection::Disabled
         };
         snapshot.tosu.message = None;
+        if !enabled {
+            snapshot.osu.running = false;
+            snapshot.osu.state = crate::app_state::OsuState::Unknown;
+            snapshot.now_playing = None;
+            snapshot.live_play = None;
+        }
     })
     .await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn set_tosu_auto_start(app: AppHandle, enabled: bool) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        state
+            .settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_tosu_auto_start(enabled)?;
+    }
+    update_snapshot(&app, |snapshot| {
+        snapshot.tosu.auto_start = enabled;
+    })
+    .await;
+    Ok(())
+}
+
+pub fn schedule_tosu_auto_start(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let enabled = {
+            let state = app.state::<AppState>();
+            let settings = state
+                .settings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            settings.tosu_auto_start()
+        };
+        if !enabled || !current_snapshot(&app).await.tosu.executable_available {
+            return;
+        }
+
+        for attempt in 0..4 {
+            if app
+                .state::<AppState>()
+                .shutting_down
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let (enabled, endpoint) = {
+                let state = app.state::<AppState>();
+                let settings = state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (settings.tosu_auto_start(), settings.endpoint())
+            };
+            if !enabled {
+                return;
+            }
+            let reachable = tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio::net::TcpStream::connect(endpoint.socket_addr()),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok());
+            if reachable {
+                return;
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+
+        let snapshot = current_snapshot(&app).await;
+        if snapshot.tracking_enabled
+            && snapshot.tosu.executable_available
+            && !snapshot.tosu.process_owned
+            && !matches!(
+                snapshot.tosu.connection,
+                TosuConnection::Connected | TosuConnection::Connecting | TosuConnection::Stale
+            )
+        {
+            let _ = launch_tosu_impl(&app).await;
+        }
+    });
 }
 
 #[tauri::command]
@@ -37,30 +124,29 @@ pub async fn launch_tosu(app: AppHandle) -> Result<(), String> {
 }
 
 pub async fn launch_tosu_impl(app: &AppHandle) -> Result<(), String> {
-    let memory_access = TosuProcess::memory_access_status();
-    if memory_access == TosuMemoryAccess::Required {
-        let message =
-            "Grant tosu Linux memory access before launching it from Companion".to_owned();
-        update_snapshot(app, |snapshot| {
-            snapshot.tosu.memory_access = memory_access;
-            snapshot.tosu.message = Some(message.clone());
-        })
-        .await;
-        return Err(message);
-    }
-
     let snapshot = current_snapshot(app).await;
-    if snapshot.tosu.connection == TosuConnection::Connected && !snapshot.tosu.process_owned {
+    if !snapshot.tracking_enabled {
+        return Err(
+            "Resume tracking before launching tosu so Companion can detect an existing process"
+                .into(),
+        );
+    }
+    if matches!(
+        snapshot.tosu.connection,
+        TosuConnection::Connected | TosuConnection::Connecting | TosuConnection::Stale
+    ) && !snapshot.tosu.process_owned
+    {
         return Err("tosu is already running outside Companion".into());
     }
 
-    let result = {
+    let (result, memory_access) = {
         let state = app.state::<AppState>();
         let mut process = state
             .process
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        process.launch()
+        let result = process.launch();
+        (result, process.memory_access_status())
     };
     match result {
         Ok(_) => {
@@ -85,7 +171,7 @@ pub async fn launch_tosu_impl(app: &AppHandle) -> Result<(), String> {
         Err(error) => {
             let message = match error {
                 crate::tosu::process::ProcessError::NotInstalled => {
-                    "tosu is not installed or could not be found on PATH".to_owned()
+                    "tosu was not found at the selected path or on PATH".to_owned()
                 }
                 _ => error.to_string(),
             };
@@ -123,6 +209,10 @@ pub async fn stop_owned_tosu_impl(app: &AppHandle) -> Result<(), String> {
                     TosuConnection::Disabled
                 };
                 snapshot.tosu.message = Some("Companion-owned tosu was stopped".into());
+                snapshot.osu.running = false;
+                snapshot.osu.state = crate::app_state::OsuState::Unknown;
+                snapshot.now_playing = None;
+                snapshot.live_play = None;
             })
             .await;
             Ok(())
@@ -133,9 +223,18 @@ pub async fn stop_owned_tosu_impl(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn grant_tosu_memory_access(app: AppHandle) -> Result<(), String> {
-    let result = tokio::task::spawn_blocking(TosuProcess::grant_memory_access)
-        .await
-        .map_err(|_| "the system authorization task could not be completed".to_owned())?;
+    let configured_path = {
+        let state = app.state::<AppState>();
+        let process = state
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        process.configured_path().map(ToOwned::to_owned)
+    };
+    let result =
+        tokio::task::spawn_blocking(move || TosuProcess::grant_memory_access_for(configured_path))
+            .await
+            .map_err(|_| "the system authorization task could not be completed".to_owned())?;
 
     match result {
         Ok(_) => {
@@ -163,7 +262,7 @@ pub async fn grant_tosu_memory_access(app: AppHandle) -> Result<(), String> {
             match restart_result {
                 Ok(restarted) => {
                     update_snapshot(&app, |snapshot| {
-                        snapshot.tosu.memory_access = TosuMemoryAccess::Granted;
+                        snapshot.tosu.memory_access = TosuMemoryAccess::Available;
                         snapshot.tosu.process_owned = restarted.is_some();
                         snapshot.tosu.connection = if snapshot.tracking_enabled {
                             TosuConnection::Searching
@@ -186,7 +285,7 @@ pub async fn grant_tosu_memory_access(app: AppHandle) -> Result<(), String> {
                     let message =
                         format!("Memory access was granted, but tosu could not restart: {error}");
                     update_snapshot(&app, |snapshot| {
-                        snapshot.tosu.memory_access = TosuMemoryAccess::Granted;
+                        snapshot.tosu.memory_access = TosuMemoryAccess::Available;
                         snapshot.tosu.process_owned = false;
                         snapshot.tosu.message = Some(message.clone());
                     })
@@ -197,8 +296,16 @@ pub async fn grant_tosu_memory_access(app: AppHandle) -> Result<(), String> {
         }
         Err(error) => {
             let message = memory_access_message(&error);
+            let memory_access = {
+                let state = app.state::<AppState>();
+                state
+                    .process
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .memory_access_status()
+            };
             update_snapshot(&app, |snapshot| {
-                snapshot.tosu.memory_access = TosuProcess::memory_access_status();
+                snapshot.tosu.memory_access = memory_access;
                 snapshot.tosu.message = Some(message.clone());
             })
             .await;
@@ -251,9 +358,92 @@ pub async fn disconnect_hanami(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn open_tosu_dashboard() -> Result<(), String> {
-    tauri_plugin_opener::open_url("http://127.0.0.1:24050", None::<&str>)
+pub fn open_tosu_dashboard(app: AppHandle) -> Result<(), String> {
+    let url = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .endpoint()
+        .dashboard_url()
+        .to_string();
+    tauri_plugin_opener::open_url(url, None::<&str>)
         .map_err(|_| "the tosu dashboard could not be opened".into())
+}
+
+#[tauri::command]
+pub async fn select_tosu_executable(app: AppHandle) -> Result<(), String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Select the tosu executable")
+        .blocking_pick_file();
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    let path = selected
+        .into_path()
+        .map_err(|_| "the selected executable is not a local file".to_owned())?;
+    if !TosuProcess::validate_executable(&path) {
+        return Err("the selected file is not an executable tosu application".into());
+    }
+
+    {
+        let state = app.state::<AppState>();
+        state
+            .settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_executable(Some(path.clone()))?;
+        state
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_configured_path(Some(path.clone()));
+    }
+    update_snapshot(&app, |snapshot| {
+        snapshot.tosu.executable_available = true;
+        snapshot.tosu.executable_path = Some(path.to_string_lossy().into_owned());
+        snapshot.tosu.executable_configured = true;
+        snapshot.tosu.message =
+            Some("The selected tosu executable will be used when launching".into());
+    })
+    .await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn reset_tosu_executable(app: AppHandle) -> Result<(), String> {
+    let resolved = {
+        let state = app.state::<AppState>();
+        state
+            .settings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_executable(None)?;
+        let mut process = state
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        process.set_configured_path(None);
+        process.resolved_executable()
+    };
+    update_snapshot(&app, |snapshot| {
+        snapshot.tosu.executable_available = resolved.is_some();
+        snapshot.tosu.executable_path = resolved
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned());
+        snapshot.tosu.executable_configured = false;
+        snapshot.tosu.message = Some("tosu executable discovery was reset to PATH".into());
+    })
+    .await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_repository() -> Result<(), String> {
+    tauri_plugin_opener::open_url("https://github.com/hanami-osu/companion", None::<&str>)
+        .map_err(|_| "the project repository could not be opened".into())
 }
 
 #[tauri::command]

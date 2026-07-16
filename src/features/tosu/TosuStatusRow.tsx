@@ -2,10 +2,11 @@ import { Play, Power, Radio, ShieldCheck } from "lucide-react";
 
 import { StatusMark } from "../../components/StatusMark";
 import type { CompanionSnapshot } from "../../lib/types";
+import type { ActionName } from "../../app/useCompanion";
 
 interface TosuStatusRowProps {
   snapshot: CompanionSnapshot;
-  pending: string | null;
+  pending: ReadonlySet<ActionName>;
   onLaunch: () => void;
   onResumeTracking: () => void;
   onGrantMemoryAccess: () => void;
@@ -16,6 +17,7 @@ const labels = {
   searching: "Searching",
   connecting: "Connecting",
   connected: "Connected",
+  stale: "Connection stale",
   unavailable: "Unavailable",
   error: "Needs attention",
 } as const;
@@ -23,12 +25,14 @@ const labels = {
 export function TosuStatusRow({ snapshot, pending, onLaunch, onResumeTracking, onGrantMemoryAccess }: TosuStatusRowProps) {
   const connected = snapshot.tosu.connection === "connected";
   const canLaunch = snapshot.trackingEnabled && !connected && !snapshot.tosu.processOwned;
-  const action = snapshot.tosu.memoryAccess === "required"
-    ? { label: "Grant access", icon: ShieldCheck, onClick: onGrantMemoryAccess, pending: pending === "grant-memory-access" }
+  const tosuBusy = ["tracking", "launch-tosu", "stop-tosu", "select-tosu", "reset-tosu", "grant-memory-access"]
+    .some((actionName) => pending.has(actionName as ActionName));
+  const action = snapshot.tosu.memoryAccess === "possibly_required"
+    ? { label: "Troubleshoot", icon: ShieldCheck, onClick: onGrantMemoryAccess, pending: tosuBusy }
     : !snapshot.trackingEnabled
-      ? { label: "Resume tracking", icon: Play, onClick: onResumeTracking, pending: pending === "tracking" }
+      ? { label: "Resume tracking", icon: Play, onClick: onResumeTracking, pending: tosuBusy }
       : canLaunch
-        ? { label: "Start tosu", icon: Power, onClick: onLaunch, pending: pending === "launch-tosu" }
+        ? { label: "Start tosu", icon: Power, onClick: onLaunch, pending: tosuBusy }
         : null;
   const ActionIcon = action?.icon;
 
@@ -39,12 +43,12 @@ export function TosuStatusRow({ snapshot, pending, onLaunch, onResumeTracking, o
         <div className="flex items-center gap-2">
           <h2 className="text-[13px] font-semibold text-zinc-100">tosu</h2>
           <span className="inline-flex items-center gap-1.5 text-[11px] text-zinc-400">
-            <StatusMark active={connected && snapshot.tosu.memoryAccess !== "required"} warning={snapshot.tosu.connection === "error" || snapshot.tosu.memoryAccess === "required"} />
+            <StatusMark active={connected} warning={snapshot.tosu.connection === "error" || snapshot.tosu.connection === "stale" || snapshot.tosu.memoryAccess === "possibly_required"} />
             {labels[snapshot.tosu.connection]}
           </span>
         </div>
         <p className="mt-0.5 truncate text-[11px] leading-4 text-muted">
-          {snapshot.tosu.memoryAccess === "required" ? "Linux permission is required for osu!lazer." : "Provides local osu! state to Companion."}
+          {snapshot.tosu.memoryAccess === "possibly_required" ? "tosu reported a Linux memory-access problem." : "Provides local osu! state to Companion."}
         </p>
       </div>
       {action && ActionIcon && (

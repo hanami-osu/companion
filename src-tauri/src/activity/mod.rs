@@ -60,4 +60,8 @@ impl ActivityTracker {
         }
         self.store.recent()
     }
+
+    pub fn reset(&mut self) {
+        self.detector.reset();
+    }
 }

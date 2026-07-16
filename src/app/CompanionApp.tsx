@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Settings2, X } from "lucide-react";
 
 import { StatusMark } from "../components/StatusMark";
@@ -6,32 +6,60 @@ import { RecentActivity } from "../features/activity/RecentActivity";
 import { HanamiStatusRow } from "../features/auth/HanamiStatusRow";
 import { IdlePanel } from "../features/live-play/IdlePanel";
 import { LivePlayPanel } from "../features/live-play/LivePlayPanel";
-import { SettingsPanel } from "../features/settings/SettingsPanel";
+import { SettingsPage } from "../features/settings/SettingsPage";
 import { TosuStatusRow } from "../features/tosu/TosuStatusRow";
 import { companionCommands } from "../lib/companion";
-import { useCompanion } from "./useCompanion";
+import { useCompanion, type ActionName } from "./useCompanion";
 
 export function CompanionApp() {
-    const { snapshot, loading, pending, actionError, clearError, run } = useCompanion();
+    const { snapshot, loading, pending, actionError, latestActionError, clearError, run } = useCompanion();
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const activePlay = snapshot.osu.state === "gameplay" && snapshot.livePlay && snapshot.nowPlaying ? { beatmap: snapshot.nowPlaying, play: snapshot.livePlay } : null;
-    const overall = loading ? "Starting" : activePlay ? "Live play" : snapshot.tosu.connection === "connected" ? (snapshot.osu.running ? "Ready" : "Waiting for osu!") : "Setup needed";
+    const settingsButtonRef = useRef<HTMLButtonElement>(null);
+    const activePlay =
+        snapshot.tosu.connection === "connected" && snapshot.osu.state === "gameplay" && snapshot.livePlay && snapshot.nowPlaying ? { beatmap: snapshot.nowPlaying, play: snapshot.livePlay } : null;
+    const overall = loading ? "Starting" : activePlay ? "Live play" : snapshot.tosu.connection === "connected" ? (snapshot.osu.running ? "Ready" : "Ready for plays") : "Setup needed";
 
-    const action = (name: string, callback: () => Promise<void>) => () => void run(name, callback);
+    const action = (name: ActionName, callback: () => Promise<void>) => () => void run(name, callback);
+    const closeSettings = useCallback(() => {
+        setSettingsOpen(false);
+        requestAnimationFrame(() => settingsButtonRef.current?.focus());
+    }, []);
+
+    if (settingsOpen) {
+        return (
+            <SettingsPage
+                snapshot={snapshot}
+                pending={pending}
+                actionError={latestActionError}
+                onClearError={clearError}
+                onBack={closeSettings}
+                onTracking={(enabled) => void run("tracking", () => companionCommands.setTracking(enabled))}
+                onTosuAutoStart={(enabled) => void run("tosu-auto-start", () => companionCommands.setTosuAutoStart(enabled))}
+                onLaunchTosu={action("launch-tosu", companionCommands.launchTosu)}
+                onStopTosu={action("stop-tosu", companionCommands.stopTosu)}
+                onSelectTosu={action("select-tosu", companionCommands.selectTosu)}
+                onResetTosu={action("reset-tosu", companionCommands.resetTosu)}
+                onGrantMemoryAccess={action("grant-memory-access", companionCommands.grantTosuMemoryAccess)}
+                onConnect={action("connect-hanami", companionCommands.connectHanami)}
+                onDisconnect={action("disconnect-hanami", companionCommands.disconnectHanami)}
+                onOpenTosu={action("open-tosu", companionCommands.openTosu)}
+                onOpenHanami={action("open-hanami", companionCommands.openHanami)}
+                onOpenRepository={action("open-repository", companionCommands.openRepository)}
+            />
+        );
+    }
 
     return (
         <div className="relative flex h-dvh min-h-0 flex-col overflow-hidden bg-canvas text-zinc-100">
             <header className="flex h-[68px] shrink-0 items-center justify-between border-b border-line px-5">
-                <div>
-                    <p className="text-[10px] font-bold uppercase tracking-[0.17em] text-hanami">Hanami</p>
-                    <h1 className="mt-1 text-[17px] font-semibold tracking-[-0.025em] text-white">Companion</h1>
-                </div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.17em] text-hanami">Hanami Companion</p>
                 <div className="flex items-center gap-3">
                     <span className="inline-flex items-center gap-2 text-[11px] font-medium text-zinc-400" role="status" aria-live="polite">
-                        <StatusMark active={snapshot.tosu.connection === "connected"} warning={snapshot.tosu.connection === "error"} />
+                        <StatusMark active={snapshot.tosu.connection === "connected"} warning={snapshot.tosu.connection === "error" || snapshot.tosu.connection === "stale"} />
                         {overall}
                     </span>
                     <button
+                        ref={settingsButtonRef}
                         type="button"
                         onClick={() => setSettingsOpen(true)}
                         className="grid h-8 w-8 place-items-center rounded-md text-zinc-500 transition hover:bg-zinc-900 hover:text-zinc-100"
@@ -76,22 +104,6 @@ export function CompanionApp() {
                 <span>{snapshot.trackingEnabled ? "Tracking in background" : "Tracking paused"}</span>
                 <span className="max-w-[220px] truncate text-right">{snapshot.tosu.message ?? snapshot.auth.message ?? "Uploads unavailable in this prototype"}</span>
             </footer>
-
-            {settingsOpen && (
-                <SettingsPanel
-                    snapshot={snapshot}
-                    pending={pending}
-                    onClose={() => setSettingsOpen(false)}
-                    onTracking={(enabled) => void run("tracking", () => companionCommands.setTracking(enabled))}
-                    onLaunchTosu={action("launch-tosu", companionCommands.launchTosu)}
-                    onStopTosu={action("stop-tosu", companionCommands.stopTosu)}
-                    onGrantMemoryAccess={action("grant-memory-access", companionCommands.grantTosuMemoryAccess)}
-                    onConnect={action("connect-hanami", companionCommands.connectHanami)}
-                    onDisconnect={action("disconnect-hanami", companionCommands.disconnectHanami)}
-                    onOpenTosu={action("open-tosu", companionCommands.openTosu)}
-                    onOpenHanami={action("open-hanami", companionCommands.openHanami)}
-                />
-            )}
         </div>
     );
 }

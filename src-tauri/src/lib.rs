@@ -3,6 +3,7 @@ mod app_state;
 mod auth;
 mod commands;
 pub mod hanami;
+mod settings;
 mod tosu;
 mod tray;
 
@@ -13,21 +14,29 @@ use tauri::Manager;
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::new())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
             commands::set_tracking_enabled,
+            commands::set_tosu_auto_start,
             commands::launch_tosu,
             commands::stop_owned_tosu,
+            commands::select_tosu_executable,
+            commands::reset_tosu_executable,
             commands::grant_tosu_memory_access,
             commands::connect_hanami,
             commands::disconnect_hanami,
             commands::open_tosu_dashboard,
             commands::open_hanami_website,
+            commands::open_repository,
         ])
         .setup(|app| {
+            let settings =
+                settings::AppSettings::load(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(AppState::new(settings));
             tray::setup(app)?;
             tosu::start_listener(app.handle().clone());
+            commands::schedule_tosu_auto_start(app.handle().clone());
             auth::start_supervisor(app.handle().clone());
             Ok(())
         })

@@ -3,9 +3,15 @@ export type TosuConnection =
   | "searching"
   | "connecting"
   | "connected"
+  | "stale"
   | "unavailable"
   | "error";
-export type TosuMemoryAccess = "not_required" | "granted" | "required" | "unavailable";
+export type TosuMemoryAccess =
+  | "not_applicable"
+  | "unknown"
+  | "available"
+  | "possibly_required"
+  | "unavailable";
 
 export type OsuState = "menu" | "song_select" | "gameplay" | "results" | "unknown";
 export type Ruleset = "osu" | "taiko" | "catch" | "mania" | "unknown";
@@ -21,6 +27,7 @@ export type AuthState =
 export interface BeatmapSummary {
   beatmapId: number | null;
   beatmapSetId: number | null;
+  checksum: string | null;
   artist: string;
   title: string;
   difficulty: string;
@@ -60,6 +67,7 @@ export interface LivePlay {
   currentPp: number | null;
   maximumPp: number | null;
   progress: number;
+  elapsedSeconds: number;
   failed: boolean;
   rank: string | null;
 }
@@ -68,8 +76,10 @@ export type PlayOutcome = "passed" | "failed" | "retried" | "quit";
 
 export interface RecentPlay {
   id: string;
+  scoreId: number | null;
   beatmap: BeatmapSummary;
-  timestamp: string;
+  startedAt: string;
+  endedAt: string;
   playerName: string | null;
   score: number;
   accuracy: number;
@@ -77,7 +87,7 @@ export interface RecentPlay {
   misses: number;
   mods: CompanionMod[];
   pp: number | null;
-  completion: number;
+  completion: number | null;
   outcome: PlayOutcome;
   rank: string | null;
 }
@@ -88,6 +98,10 @@ export interface CompanionSnapshot {
     connection: TosuConnection;
     processOwned: boolean;
     executableAvailable: boolean;
+    executablePath: string | null;
+    executableConfigured: boolean;
+    autoStart: boolean;
+    port: number;
     memoryAccess: TosuMemoryAccess;
     message: string | null;
   };
@@ -115,7 +129,11 @@ export const initialSnapshot: CompanionSnapshot = {
     connection: "searching",
     processOwned: false,
     executableAvailable: false,
-    memoryAccess: "not_required",
+    executablePath: null,
+    executableConfigured: false,
+    autoStart: true,
+    port: 24050,
+    memoryAccess: "unknown",
     message: null,
   },
   osu: { running: false, state: "unknown", client: null },

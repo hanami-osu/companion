@@ -2,10 +2,17 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(target_os = "linux")]
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read},
+};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -17,9 +24,11 @@ const PTRACE_CAPABILITY: &str = "cap_sys_ptrace=eip";
 #[serde(rename_all = "snake_case")]
 pub enum TosuMemoryAccess {
     #[default]
-    NotRequired,
-    Granted,
-    Required,
+    Unknown,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    NotApplicable,
+    Available,
+    PossiblyRequired,
     Unavailable,
 }
 
@@ -74,6 +83,7 @@ impl ProcessOwnership {
 
 struct OwnedProcess {
     child: Child,
+    memory_failure_observed: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -83,16 +93,58 @@ pub struct TosuProcess {
 }
 
 impl TosuProcess {
-    pub fn resolve_executable() -> Option<PathBuf> {
-        resolve_from(None)
+    pub fn new(configured_path: Option<PathBuf>) -> Self {
+        Self {
+            configured_path,
+            owned: None,
+        }
     }
 
-    pub fn memory_access_status() -> TosuMemoryAccess {
-        memory_access_status()
+    pub fn resolved_executable(&self) -> Option<PathBuf> {
+        resolve_from(self.configured_path.as_deref())
     }
 
-    pub fn grant_memory_access() -> Result<PathBuf, MemoryAccessError> {
-        grant_memory_access()
+    pub fn configured_path(&self) -> Option<&Path> {
+        self.configured_path.as_deref()
+    }
+
+    pub fn set_configured_path(&mut self, path: Option<PathBuf>) {
+        self.configured_path = path;
+    }
+
+    pub fn validate_executable(path: &Path) -> bool {
+        if !path.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(windows)]
+        {
+            path.extension().is_some_and(|extension| {
+                matches!(
+                    extension.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "exe" | "cmd" | "bat"
+                )
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            true
+        }
+    }
+
+    pub fn memory_access_status(&self) -> TosuMemoryAccess {
+        memory_access_status(self.configured_path.as_deref())
+    }
+
+    pub fn grant_memory_access_for(
+        configured_path: Option<PathBuf>,
+    ) -> Result<PathBuf, MemoryAccessError> {
+        grant_memory_access(configured_path.as_deref())
     }
 
     pub fn launch(&mut self) -> Result<PathBuf, ProcessError> {
@@ -103,14 +155,32 @@ impl TosuProcess {
 
         let executable =
             resolve_from(self.configured_path.as_deref()).ok_or(ProcessError::NotInstalled)?;
-        let child = Command::new(&executable)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut command = Command::new(&executable);
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        #[cfg(target_os = "linux")]
+        command.stderr(Stdio::piped());
+        #[cfg(not(target_os = "linux"))]
+        command.stderr(Stdio::null());
 
-        self.owned = Some(OwnedProcess { child });
+        let mut child = command.spawn()?;
+        let memory_failure_observed = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        if let Some(stderr) = child.stderr.take() {
+            watch_memory_access_errors(stderr, Arc::clone(&memory_failure_observed));
+        }
+
+        self.owned = Some(OwnedProcess {
+            child,
+            memory_failure_observed,
+        });
         Ok(executable)
+    }
+
+    pub fn memory_failure_observed(&mut self) -> bool {
+        self.refresh();
+        self.owned
+            .as_ref()
+            .is_some_and(|owned| owned.memory_failure_observed.load(Ordering::Relaxed))
     }
 
     pub fn refresh(&mut self) -> bool {
@@ -157,8 +227,8 @@ impl TosuProcess {
 }
 
 fn resolve_from(configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = configured.filter(|path| path.is_file()) {
-        return Some(path.to_path_buf());
+    if let Some(path) = configured {
+        return TosuProcess::validate_executable(path).then(|| path.to_path_buf());
     }
 
     let names: &[&str] = if cfg!(windows) {
@@ -170,12 +240,12 @@ fn resolve_from(configured: Option<&Path>) -> Option<PathBuf> {
         .into_iter()
         .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| TosuProcess::validate_executable(candidate))
 }
 
 #[cfg(target_os = "linux")]
-fn memory_access_status() -> TosuMemoryAccess {
-    let Some(target) = resolve_capability_target() else {
+fn memory_access_status(configured: Option<&Path>) -> TosuMemoryAccess {
+    let Some(target) = resolve_capability_target(configured) else {
         return TosuMemoryAccess::Unavailable;
     };
     let Some(getcap) = resolve_trusted_tool("getcap") else {
@@ -184,9 +254,9 @@ fn memory_access_status() -> TosuMemoryAccess {
     match Command::new(getcap).arg(target).output() {
         Ok(output) if output.status.success() => {
             if has_effective_ptrace_capability(&String::from_utf8_lossy(&output.stdout)) {
-                TosuMemoryAccess::Granted
+                TosuMemoryAccess::Available
             } else {
-                TosuMemoryAccess::Required
+                TosuMemoryAccess::Unknown
             }
         }
         _ => TosuMemoryAccess::Unavailable,
@@ -194,14 +264,14 @@ fn memory_access_status() -> TosuMemoryAccess {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn memory_access_status() -> TosuMemoryAccess {
-    TosuMemoryAccess::NotRequired
+fn memory_access_status(_configured: Option<&Path>) -> TosuMemoryAccess {
+    TosuMemoryAccess::NotApplicable
 }
 
 #[cfg(target_os = "linux")]
-fn grant_memory_access() -> Result<PathBuf, MemoryAccessError> {
-    let target = resolve_capability_target().ok_or_else(|| {
-        if TosuProcess::resolve_executable().is_some() {
+fn grant_memory_access(configured: Option<&Path>) -> Result<PathBuf, MemoryAccessError> {
+    let target = resolve_capability_target(configured).ok_or_else(|| {
+        if resolve_from(configured).is_some() {
             MemoryAccessError::UnsupportedLauncher
         } else {
             MemoryAccessError::NotInstalled
@@ -219,20 +289,20 @@ fn grant_memory_access() -> Result<PathBuf, MemoryAccessError> {
     if !status.success() {
         return Err(MemoryAccessError::AuthorizationDenied);
     }
-    if memory_access_status() != TosuMemoryAccess::Granted {
+    if memory_access_status(configured) != TosuMemoryAccess::Available {
         return Err(MemoryAccessError::VerificationFailed);
     }
     Ok(target)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn grant_memory_access() -> Result<PathBuf, MemoryAccessError> {
+fn grant_memory_access(_configured: Option<&Path>) -> Result<PathBuf, MemoryAccessError> {
     Err(MemoryAccessError::UnsupportedPlatform)
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_capability_target() -> Option<PathBuf> {
-    let launcher = TosuProcess::resolve_executable()?.canonicalize().ok()?;
+fn resolve_capability_target(configured: Option<&Path>) -> Option<PathBuf> {
+    let launcher = resolve_from(configured)?.canonicalize().ok()?;
     if is_elf_binary(&launcher) {
         return Some(launcher);
     }
@@ -245,6 +315,25 @@ fn resolve_capability_target() -> Option<PathBuf> {
     let target = parse_wrapper_exec_target(script)?;
     let canonical = target.canonicalize().ok()?;
     is_elf_binary(&canonical).then_some(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn watch_memory_access_errors(stderr: std::process::ChildStderr, observed: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if indicates_memory_access_failure(&line) {
+                observed.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn indicates_memory_access_failure(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("failed to read address")
+        || line.contains("cap_sys_ptrace")
+        || line.contains("ptrace") && line.contains("permission")
 }
 
 #[cfg(target_os = "linux")]
@@ -337,6 +426,20 @@ exec /opt/tosu/tosu --update=false "$@"
         assert!(!has_effective_ptrace_capability("/opt/tosu/tosu\n"));
         assert!(!has_effective_ptrace_capability(
             "/opt/tosu/tosu cap_net_bind_service=ep\n"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recognizes_runtime_memory_access_failures_without_assuming_them() {
+        assert!(indicates_memory_access_failure(
+            "failed to read address 40000000 of size 600000"
+        ));
+        assert!(indicates_memory_access_failure(
+            "ptrace permission denied while scanning lazer"
+        ));
+        assert!(!indicates_memory_access_failure(
+            "Searching for osu! process..."
         ));
     }
 }

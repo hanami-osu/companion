@@ -2,10 +2,11 @@ import { Link2 } from "lucide-react";
 
 import { StatusMark } from "../../components/StatusMark";
 import type { AuthState } from "../../lib/types";
+import type { ActionName } from "../../app/useCompanion";
 
 interface HanamiStatusRowProps {
   state: AuthState;
-  pending: string | null;
+  pending: ReadonlySet<ActionName>;
   onConnect: () => void;
 }
 
@@ -40,7 +41,7 @@ export function HanamiStatusRow({ state, pending, onConnect }: HanamiStatusRowPr
         <button
           type="button"
           onClick={onConnect}
-          disabled={pending === "connect-hanami"}
+          disabled={pending.has("connect-hanami") || pending.has("disconnect-hanami")}
           className="h-8 rounded-md border border-zinc-700 px-2.5 text-[11px] font-semibold text-zinc-200 transition hover:border-zinc-500 hover:text-white disabled:opacity-50"
         >
           Connect

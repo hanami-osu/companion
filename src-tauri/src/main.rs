@@ -5,16 +5,24 @@
 fn configure_linux_renderer() {
     use std::env;
 
-    // manual override for people who like wayland for some reason.
     if env::var_os("HANAMI_FORCE_WAYLAND").is_some() {
+        unsafe {
+            env::set_var("GDK_BACKEND", "wayland");
+        }
         return;
     }
-    // we don't care about errors here.
+
+    if env::var_os("HANAMI_FORCE_X11").is_some() {
+        unsafe {
+            env::set_var("GDK_BACKEND", "x11");
+        }
+        return;
+    }
+
     let session_type = env::var("XDG_SESSION_TYPE")
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    // return early since it's already x11.
     if session_type != "wayland" {
         return;
     }
@@ -27,8 +35,8 @@ fn configure_linux_renderer() {
     let xwayland_available = env::var_os("DISPLAY").is_some();
 
     if !is_gnome && xwayland_available {
-        println!("working in x11.");
-
+        // WebKitGTK native decorations are unreliable on some non-GNOME Wayland
+        // compositors. Prefer XWayland there while preserving user overrides.
         unsafe {
             env::set_var("GDK_BACKEND", "x11");
         }

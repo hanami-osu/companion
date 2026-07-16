@@ -79,8 +79,8 @@ impl LoopbackListener {
         let (status, heading, body) = if parsed.is_ok() {
             (
                 "200 OK",
-                "Hanami connected",
-                "You can close this tab and return to Hanami Companion.",
+                "Authorization received",
+                "Return to Hanami Companion while it completes sign-in.",
             )
         } else {
             (

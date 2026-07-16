@@ -11,17 +11,17 @@ interface IdlePanelProps {
 }
 
 export function IdlePanel({ connection, osuRunning, beatmap }: IdlePanelProps) {
-    const heading = connection !== "connected" ? "Connect to tosu" : osuRunning ? "Waiting for a play" : "Waiting for osu!";
+    const heading = connection !== "connected" ? "Connect to tosu" : osuRunning ? "Waiting for a play" : "Ready for plays";
     const copy =
         connection !== "connected"
             ? "Start tosu, then Companion will connect to its local v2 service automatically."
             : osuRunning
               ? "Choose a beatmap and start playing."
-              : "tosu is ready. Open osu! to begin tracking local play state.";
+              : "tosu is connected. Open osu! and Companion will pick up your next play.";
 
     return (
         <section className="animate-content-in py-5" aria-labelledby="idle-heading">
-            {beatmap ? (
+            {connection === "connected" && beatmap ? (
                 <div className="flex items-center gap-4">
                     <BeatmapArtwork url={beatmap.backgroundUrl} alt={`${beatmap.artist} — ${beatmap.title}`} className="h-[76px] w-[76px] shrink-0 rounded-lg opacity-80" />
                     <div className="min-w-0">

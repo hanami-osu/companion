@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
-use url::Url;
 
+use super::config::TosuEndpoint;
 use crate::{
     activity::model::{PlayObservation, ResultObservation},
     app_state::{
@@ -11,12 +11,10 @@ use crate::{
     },
 };
 
-pub const BACKGROUND_URL: &str = "http://127.0.0.1:24050/files/beatmap/background";
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PayloadError {
-    #[error("tosu is not ready")]
-    NotReady,
+    #[error("tosu is not ready: {0}")]
+    NotReady(String),
     #[error("payload is not valid v2 tosu state")]
     Unexpected,
     #[error("payload could not be decoded: {0}")]
@@ -172,8 +170,8 @@ impl RawTosuPayload {
     pub fn parse(payload: &str) -> Result<Self, PayloadError> {
         let value: Self = serde_json::from_str(payload)
             .map_err(|error| PayloadError::InvalidJson(error.to_string()))?;
-        if value.error.is_some() {
-            return Err(PayloadError::NotReady);
+        if let Some(error) = value.error.as_deref() {
+            return Err(PayloadError::NotReady(error.to_owned()));
         }
         if value.state.number.is_none()
             || (value.client.is_none()
@@ -187,7 +185,7 @@ impl RawTosuPayload {
         Ok(value)
     }
 
-    pub fn normalize(self) -> NormalizedTosu {
+    pub fn normalize(self, endpoint: &TosuEndpoint) -> NormalizedTosu {
         let state = normalize_state(self.state.number, self.state.name.as_deref());
         let ruleset = normalize_ruleset(
             self.play.mode.number.or(self.beatmap.mode.number),
@@ -197,7 +195,7 @@ impl RawTosuPayload {
                 .as_deref()
                 .or(self.beatmap.mode.name.as_deref()),
         );
-        let beatmap = normalize_beatmap(&self.beatmap, ruleset);
+        let beatmap = normalize_beatmap(&self.beatmap, ruleset, endpoint);
         let mods = normalize_mods(&self.play.mods);
         let live_play = (state == OsuState::Gameplay).then(|| normalize_live(&self));
         let result = (state == OsuState::Results).then(|| normalize_result(&self.results_screen));
@@ -257,24 +255,34 @@ fn normalize_ruleset(number: Option<i32>, name: Option<&str>) -> Ruleset {
     }
 }
 
-fn normalize_beatmap(raw: &RawBeatmap, ruleset: Ruleset) -> Option<BeatmapSummary> {
+fn normalize_beatmap(
+    raw: &RawBeatmap,
+    ruleset: Ruleset,
+    endpoint: &TosuEndpoint,
+) -> Option<BeatmapSummary> {
     if positive_id(raw.id).is_none() && raw.title.as_deref().unwrap_or_default().is_empty() {
         return None;
     }
     Some(BeatmapSummary {
         beatmap_id: positive_id(raw.id),
         beatmap_set_id: positive_id(raw.set),
+        checksum: raw
+            .checksum
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         artist: raw.artist.clone().unwrap_or_default(),
         title: raw.title.clone().unwrap_or_default(),
         difficulty: raw.version.clone().unwrap_or_default(),
         mapper: raw.mapper.clone().unwrap_or_default(),
         ruleset,
-        background_url: background_url(raw),
+        background_url: background_url(raw, endpoint),
         max_combo: raw.stats.max_combo,
     })
 }
 
-fn background_url(raw: &RawBeatmap) -> Option<String> {
+fn background_url(raw: &RawBeatmap, endpoint: &TosuEndpoint) -> Option<String> {
     let cache_key = raw
         .checksum
         .as_deref()
@@ -293,9 +301,7 @@ fn background_url(raw: &RawBeatmap) -> Option<String> {
             ))
         })?;
 
-    let mut url = Url::parse(BACKGROUND_URL).expect("background endpoint must be a valid URL");
-    url.query_pairs_mut().append_pair("beatmap", &cache_key);
-    Some(url.to_string())
+    Some(endpoint.background_url(&cache_key).to_string())
 }
 
 fn normalize_live(raw: &RawTosuPayload) -> LivePlay {
@@ -331,23 +337,45 @@ fn normalize_live(raw: &RawTosuPayload) -> LivePlay {
             .or(raw.play.pp.max_achieved)
             .or(raw.play.pp.fc),
         progress,
+        elapsed_seconds: ((raw.beatmap.time.live.unwrap_or(start) - start) / 1_000.0).max(0.0),
         failed: raw.play.failed.unwrap_or(false),
         rank: raw.play.rank.current.clone(),
     }
 }
 
 fn normalize_result(raw: &RawResults) -> ResultObservation {
+    let judged_objects = raw.hits.total_if_present();
     ResultObservation {
         score_id: positive_id(raw.score_id),
         timestamp: raw.created_at.as_deref().and_then(parse_timestamp),
         player_name: raw.player_name.clone().filter(|value| !value.is_empty()),
-        score: raw.score.unwrap_or_default(),
-        accuracy: raw.accuracy.unwrap_or_default(),
-        combo: raw.max_combo.unwrap_or_default(),
-        misses: raw.hits.misses.unwrap_or_default(),
+        score: raw.score,
+        accuracy: raw.accuracy,
+        combo: raw.max_combo,
+        misses: raw.hits.misses,
+        judged_objects,
         mods: normalize_mods(&raw.mods),
         pp: raw.pp.current,
         rank: raw.rank.clone().filter(|value| !value.is_empty()),
+    }
+}
+
+impl RawHits {
+    fn total_if_present(&self) -> Option<u64> {
+        let values = [
+            self.great,
+            self.ok,
+            self.meh,
+            self.katu,
+            self.geki,
+            self.misses,
+        ];
+        values.iter().any(Option::is_some).then(|| {
+            values
+                .into_iter()
+                .map(|value| u64::from(value.unwrap_or_default()))
+                .sum()
+        })
     }
 }
 
@@ -433,17 +461,21 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
 
+    fn endpoint() -> TosuEndpoint {
+        TosuEndpoint::default()
+    }
+
     #[test]
     fn parses_representative_v2_gameplay_fixture() {
         let raw = RawTosuPayload::parse(include_str!("fixtures/v2_gameplay.json"))
             .expect("valid fixture");
-        let normalized = raw.normalize();
+        let normalized = raw.normalize(&endpoint());
         assert_eq!(normalized.osu.state, OsuState::Gameplay);
         let now_playing = normalized.now_playing.expect("beatmap");
         assert_eq!(now_playing.beatmap.beatmap_id, Some(1234));
         assert_eq!(
             now_playing.beatmap.background_url.as_deref(),
-            Some("http://127.0.0.1:24050/files/beatmap/background?beatmap=fixture-checksum")
+            Some("http://127.0.0.1:24050/files/beatmap/background?v=fixture-checksum")
         );
         assert_eq!(mod_acronyms(&now_playing.mods), ["HD", "DT"]);
         assert_eq!(
@@ -461,7 +493,7 @@ mod tests {
             r#"{"client":"future","state":{"number":999,"name":"newState"},"unknown":{"nested":true}}"#,
         )
         .expect("tolerant payload");
-        let normalized = raw.normalize();
+        let normalized = raw.normalize(&endpoint());
         assert_eq!(normalized.osu.state, OsuState::Unknown);
         assert!(normalized.now_playing.is_none());
     }
@@ -484,7 +516,7 @@ mod tests {
         )
         .expect("song select payload");
 
-        let normalized = raw.normalize();
+        let normalized = raw.normalize(&endpoint());
         assert_eq!(normalized.osu.state, OsuState::SongSelect);
         let mods = normalized.now_playing.expect("selected map").mods;
         assert_eq!(mod_acronyms(&mods), ["DA", "WG", "SV2", "FUTURE_MOD"]);
@@ -536,13 +568,13 @@ mod tests {
         )
         .expect("local beatmap payload");
 
-        let normalized = raw.normalize();
+        let normalized = raw.normalize(&endpoint());
         let beatmap = normalized.now_playing.expect("local beatmap").beatmap;
         assert_eq!(beatmap.beatmap_id, None);
         assert_eq!(beatmap.beatmap_set_id, None);
         assert_eq!(
             beatmap.background_url.as_deref(),
-            Some("http://127.0.0.1:24050/files/beatmap/background?beatmap=local-checksum")
+            Some("http://127.0.0.1:24050/files/beatmap/background?v=local-checksum")
         );
         assert_eq!(
             normalized.observation.result.expect("result").score_id,
@@ -561,7 +593,10 @@ mod tests {
             ..RawBeatmap::default()
         };
 
-        assert_ne!(background_url(&first), background_url(&second));
+        assert_ne!(
+            background_url(&first, &endpoint()),
+            background_url(&second, &endpoint())
+        );
     }
 
     #[test]
@@ -573,10 +608,8 @@ mod tests {
         };
 
         assert_eq!(
-            background_url(&beatmap).as_deref(),
-            Some(
-                "http://127.0.0.1:24050/files/beatmap/background?beatmap=A+title+%26+more%3AHard%2B"
-            )
+            background_url(&beatmap, &endpoint()).as_deref(),
+            Some("http://127.0.0.1:24050/files/beatmap/background?v=A+title+%26+more%3AHard%2B")
         );
     }
 }

@@ -1,4 +1,5 @@
 import type { RecentPlay } from "../../lib/types";
+import { formatCompletion, formatMisses } from "./format";
 
 interface RecentActivityProps {
     plays: RecentPlay[];
@@ -26,18 +27,19 @@ export function RecentActivity({ plays }: RecentActivityProps) {
                                     {play.beatmap.title || "Unknown beatmap"}
                                 </p>
                                 <p className="mt-1 truncate text-[10px] text-zinc-600">
-                                    <span className="tabular-nums text-zinc-500">{formatCompletion(play.completion)} complete</span>
+                                    {play.outcome !== "passed" && play.completion != null && (
+                                        <span className="tabular-nums text-zinc-500">{formatCompletion(play.completion)} complete · </span>
+                                    )}
                                     <span>
-                                        {" "}
-                                        · {play.accuracy.toFixed(2)}% · {play.combo}× · {play.misses} miss
+                                        {play.accuracy.toFixed(2)}% · {play.combo}× · {formatMisses(play.misses)}
                                     </span>
                                     {play.mods.length > 0 ? ` · +${play.mods.map((mod) => mod.acronym).join("")}` : ""}
                                 </p>
                             </div>
                             <div className="text-right">
                                 <p className="text-[11px] font-semibold tabular-nums text-zinc-300">{play.pp == null ? "—" : `${Math.round(play.pp)} pp`}</p>
-                                <time dateTime={play.timestamp} className="mt-1 block text-[9px] text-zinc-700">
-                                    {formatTime(play.timestamp)}
+                                <time dateTime={play.endedAt} className="mt-1 block text-[9px] text-zinc-700">
+                                    {formatTime(play.endedAt)}
                                 </time>
                             </div>
                         </li>
@@ -46,10 +48,6 @@ export function RecentActivity({ plays }: RecentActivityProps) {
             )}
         </section>
     );
-}
-
-function formatCompletion(completion: number) {
-    return `${Math.round(Math.min(1, Math.max(0, completion)) * 100)}%`;
 }
 
 function outcomeLabel(play: RecentPlay) {

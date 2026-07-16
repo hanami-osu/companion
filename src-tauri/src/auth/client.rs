@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
@@ -68,6 +69,28 @@ pub struct TokenResponse {
     pub token_type: Option<String>,
 }
 
+#[async_trait]
+pub trait AuthApi: Send + Sync {
+    fn authorization_url(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        challenge: &str,
+        device_name: &str,
+        platform: &str,
+    ) -> Result<Url, AuthClientError>;
+
+    async fn exchange_code(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+    ) -> Result<TokenResponse, AuthClientError>;
+
+    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, AuthClientError>;
+    async fn revoke(&self, token: &str) -> Result<(), AuthClientError>;
+}
+
 pub struct HanamiClient {
     http: Client,
     config: AuthConfig,
@@ -85,7 +108,7 @@ impl HanamiClient {
         }
     }
 
-    pub fn authorization_url(
+    fn build_authorization_url(
         &self,
         redirect_uri: &str,
         state: &str,
@@ -107,7 +130,7 @@ impl HanamiClient {
         Ok(url)
     }
 
-    pub async fn exchange_code(
+    async fn exchange_code_request(
         &self,
         code: &str,
         redirect_uri: &str,
@@ -123,7 +146,7 @@ impl HanamiClient {
         .await
     }
 
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, AuthClientError> {
+    async fn refresh_request(&self, refresh_token: &str) -> Result<TokenResponse, AuthClientError> {
         self.token_request(&[
             ("grant_type", "refresh_token"),
             ("client_id", CLIENT_ID),
@@ -150,7 +173,7 @@ impl HanamiClient {
         parse_token_response(&bytes)
     }
 
-    pub async fn revoke(&self, token: &str) -> Result<(), AuthClientError> {
+    async fn revoke_request(&self, token: &str) -> Result<(), AuthClientError> {
         let response = self
             .http
             .post(format!("{}/oauth/revoke", self.config.base_url()))
@@ -163,6 +186,38 @@ impl HanamiClient {
         } else {
             Err(AuthClientError::Rejected)
         }
+    }
+}
+
+#[async_trait]
+impl AuthApi for HanamiClient {
+    fn authorization_url(
+        &self,
+        redirect_uri: &str,
+        state: &str,
+        challenge: &str,
+        device_name: &str,
+        platform: &str,
+    ) -> Result<Url, AuthClientError> {
+        self.build_authorization_url(redirect_uri, state, challenge, device_name, platform)
+    }
+
+    async fn exchange_code(
+        &self,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+    ) -> Result<TokenResponse, AuthClientError> {
+        self.exchange_code_request(code, redirect_uri, verifier)
+            .await
+    }
+
+    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, AuthClientError> {
+        self.refresh_request(refresh_token).await
+    }
+
+    async fn revoke(&self, token: &str) -> Result<(), AuthClientError> {
+        self.revoke_request(token).await
     }
 }
 

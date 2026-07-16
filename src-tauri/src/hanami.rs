@@ -38,8 +38,10 @@ mod tests {
         let result = uploader
             .upload(&RecentPlay {
                 id: "test".into(),
+                score_id: None,
                 beatmap: Default::default(),
-                timestamp: chrono::Utc::now(),
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
                 player_name: None,
                 score: 0,
                 accuracy: 0.0,
@@ -47,7 +49,7 @@ mod tests {
                 misses: 0,
                 mods: vec![],
                 pp: None,
-                completion: 0.5,
+                completion: Some(0.5),
                 outcome: crate::activity::model::PlayOutcome::Quit,
                 rank: None,
             })

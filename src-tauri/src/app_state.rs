@@ -13,6 +13,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
 use crate::{
     auth::{AuthConfig, AuthRuntime},
+    settings::AppSettings,
     tosu::process::{TosuMemoryAccess, TosuProcess},
 };
 
@@ -26,6 +27,7 @@ pub enum TosuConnection {
     Searching,
     Connecting,
     Connected,
+    Stale,
     Unavailable,
     Error,
 }
@@ -36,6 +38,10 @@ pub struct TosuStatus {
     pub connection: TosuConnection,
     pub process_owned: bool,
     pub executable_available: bool,
+    pub executable_path: Option<String>,
+    pub executable_configured: bool,
+    pub auto_start: bool,
+    pub port: u16,
     pub memory_access: TosuMemoryAccess,
     pub message: Option<String>,
 }
@@ -75,6 +81,7 @@ pub enum Ruleset {
 pub struct BeatmapSummary {
     pub beatmap_id: Option<u64>,
     pub beatmap_set_id: Option<u64>,
+    pub checksum: Option<String>,
     pub artist: String,
     pub title: String,
     pub difficulty: String,
@@ -119,7 +126,7 @@ pub struct HitCounts {
     pub misses: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LivePlay {
     pub player_name: Option<String>,
@@ -131,6 +138,7 @@ pub struct LivePlay {
     pub current_pp: Option<f64>,
     pub maximum_pp: Option<f64>,
     pub progress: f64,
+    pub elapsed_seconds: f64,
     pub failed: bool,
     pub rank: Option<String>,
 }
@@ -175,6 +183,7 @@ pub struct AppState {
     pub snapshot: RwLock<CompanionSnapshot>,
     pub tracking: watch::Sender<bool>,
     pub process: Mutex<TosuProcess>,
+    pub settings: Mutex<AppSettings>,
     pub auth: AsyncMutex<AuthRuntime>,
     pub tosu_listener_started: AtomicBool,
     pub auth_supervisor_started: AtomicBool,
@@ -183,11 +192,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(settings: AppSettings) -> Self {
         let (tracking, _) = watch::channel(true);
         let auth_config = AuthConfig::from_environment();
-        let executable_available = TosuProcess::resolve_executable().is_some();
-        let memory_access = TosuProcess::memory_access_status();
+        let endpoint = settings.endpoint();
+        let process = TosuProcess::new(settings.executable());
+        let resolved_executable = process.resolved_executable();
+        let executable_available = resolved_executable.is_some();
+        let memory_access = process.memory_access_status();
 
         Self {
             snapshot: RwLock::new(CompanionSnapshot {
@@ -196,6 +208,12 @@ impl AppState {
                     connection: TosuConnection::Searching,
                     process_owned: false,
                     executable_available,
+                    executable_path: resolved_executable
+                        .as_deref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    executable_configured: settings.executable().is_some(),
+                    auto_start: settings.tosu_auto_start(),
+                    port: endpoint.port(),
                     memory_access,
                     message: None,
                 },
@@ -213,7 +231,8 @@ impl AppState {
                 upload_available: false,
             }),
             tracking,
-            process: Mutex::new(TosuProcess::default()),
+            process: Mutex::new(process),
+            settings: Mutex::new(settings),
             auth: AsyncMutex::new(AuthRuntime::new(auth_config)),
             tosu_listener_started: AtomicBool::new(false),
             auth_supervisor_started: AtomicBool::new(false),
@@ -245,4 +264,61 @@ where
     let _ = app.emit(SNAPSHOT_EVENT, &snapshot);
     crate::tray::sync_menu(app, &snapshot);
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialized_snapshot_contract_uses_the_frontend_field_names() {
+        let snapshot = CompanionSnapshot {
+            tracking_enabled: true,
+            tosu: TosuStatus {
+                connection: TosuConnection::Stale,
+                process_owned: false,
+                executable_available: true,
+                executable_path: Some("/usr/bin/tosu".into()),
+                executable_configured: false,
+                auto_start: true,
+                port: 24_050,
+                memory_access: TosuMemoryAccess::PossiblyRequired,
+                message: None,
+            },
+            osu: OsuStatus::default(),
+            now_playing: None,
+            live_play: None,
+            recent_activity: Vec::new(),
+            auth: AuthStatus {
+                state: AuthState::SignedOut,
+                message: None,
+                base_url: "https://hanami.yorunoken.com".into(),
+                is_production: true,
+            },
+            app_version: "0.1.0".into(),
+            upload_available: false,
+        };
+
+        let value = serde_json::to_value(snapshot).expect("snapshot serialization");
+        let object = value.as_object().expect("snapshot object");
+        for key in [
+            "trackingEnabled",
+            "tosu",
+            "osu",
+            "nowPlaying",
+            "livePlay",
+            "recentActivity",
+            "auth",
+            "appVersion",
+            "uploadAvailable",
+        ] {
+            assert!(object.contains_key(key), "missing contract key {key}");
+        }
+        assert_eq!(value["tosu"]["connection"], "stale");
+        assert_eq!(value["tosu"]["memoryAccess"], "possibly_required");
+        assert_eq!(value["tosu"]["port"], 24_050);
+        assert_eq!(value["tosu"]["executableConfigured"], false);
+        assert_eq!(value["tosu"]["autoStart"], true);
+        assert_eq!(value["auth"]["state"], "signed_out");
+    }
 }
