@@ -22,11 +22,13 @@ pub fn run() {
         .manage(tosu::TosuState {
             process: std::sync::Mutex::new(None),
         })
+        .manage(ws_client::TosuConnectionState::default())
         .manage(tokio::sync::Mutex::new(hanami_api::HanamiClient::new()))
         .invoke_handler(tauri::generate_handler![
             greet,
             tosu::toggle_tosu,
-            tosu::is_tosu_running
+            tosu::is_tosu_running,
+            ws_client::is_tosu_connected
         ])
         .setup(|app| {
             ws_client::start_tosu_listener(app.handle().clone());

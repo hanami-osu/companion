@@ -1,6 +1,6 @@
 {
     "$schema": "https://schema.tauri.app/config/2",
-    "productName": "tauri-app",
+    "productName": "Hanami Companion",
     "version": "0.1.0",
     "identifier": "website.hanami.companion",
     "build": {
@@ -10,13 +10,15 @@
         "frontendDist": "../dist"
     },
     "app": {
+        "enableGTKAppId": true,
         "windows": [
             {
                 "title": "Hanami Companion",
                 "width": 400,
                 "height": 550,
                 "resizable": false,
-                "maximizable": false
+                "maximizable": false,
+                "decorations": true
             }
         ],
         "trayIcon": {

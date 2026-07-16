@@ -1,57 +1,99 @@
-use futures_util::StreamExt;
-use serde_json::Value;
-use tauri::AppHandle;
-use tokio_tungstenite::connect_async;
-use tauri::Emitter;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
+use futures_util::{SinkExt, StreamExt};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::time::{Instant, MissedTickBehavior};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+
+const TOSU_URL: &str = "ws://127.0.0.1:24050/ws";
+const CONNECTION_EVENT: &str = "tosu-connection-status";
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Default)]
+pub struct TosuConnectionState {
+    connected: AtomicBool,
+}
+
+impl TosuConnectionState {
+    fn get(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    fn set(&self, connected: bool) -> bool {
+        self.connected.swap(connected, Ordering::SeqCst) != connected
+    }
+}
+
+#[tauri::command]
+pub fn is_tosu_connected(state: State<'_, TosuConnectionState>) -> bool {
+    state.get()
+}
+
+fn publish_connection_status(app: &AppHandle, connected: bool) {
+    let state = app.state::<TosuConnectionState>();
+
+    if state.set(connected) {
+        let _ = app.emit(CONNECTION_EVENT, connected);
+    }
+}
+
+async fn monitor_connection<S>(app: &AppHandle, socket: WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut write, mut read) = socket.split();
+    let started_at = Instant::now();
+    let mut last_verified = None;
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                let last_response = last_verified.unwrap_or(started_at);
+
+                if last_response.elapsed() >= CONNECTION_TIMEOUT {
+                    break;
+                }
+
+                if write.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
+            message = read.next() => {
+                match message {
+                    Some(Ok(Message::Pong(_))) => {
+                        last_verified = Some(Instant::now());
+                        publish_connection_status(app, true);
+                    }
+                    Some(Ok(Message::Text(payload))) if serde_json::from_str::<serde_json::Value>(&payload).is_ok() => {
+                        last_verified = Some(Instant::now());
+                        publish_connection_status(app, true);
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+}
 
 pub fn start_tosu_listener(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let url = "ws://127.0.0.1:24050/ws";
-        
         loop {
-            // Attempt to connect
-            if let Ok((ws_stream, _)) = connect_async(url).await {
-                println!("Connected to tosu WebSocket");
-                let _ = app.emit("activity-log", "Connected to tosu WebSocket.");
+            publish_connection_status(&app, false);
 
-                let (mut _write, mut read) = ws_stream.split();
-                let mut last_state = String::new();
-
-                while let Some(msg) = read.next().await {
-                    if let Ok(msg) = msg {
-                        if msg.is_text() {
-                            let text = msg.to_text().unwrap();
-                            if let Ok(json) = serde_json::from_str::<Value>(text) {
-                                // Basic state transition detection based on common gosumemory/tosu schema
-                                // The state is usually under menu.state
-                                if let Some(state) = json.pointer("/menu/state").and_then(|s| s.as_u64()) {
-                                    // 2 = Playing, 7 = Results Screen (Ranking)
-                                    let current_state = match state {
-                                        2 => "Playing",
-                                        7 => "Ranking",
-                                        _ => "Idle",
-                                    };
-
-                                    if current_state != last_state {
-                                        if last_state == "Playing" && current_state == "Ranking" {
-                                            println!("Play finished! Capturing score...");
-                                            let _ = app.emit("activity-log", "Play finished! Capturing score...");
-                                            
-                                            // TODO: Extract score, UR, mods, md5 and send to Hanami Web
-                                        }
-                                        last_state = current_state.to_string();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                println!("Disconnected from tosu WebSocket");
-                let _ = app.emit("activity-log", "Disconnected from tosu WebSocket.");
+            if let Ok((socket, _)) = connect_async(TOSU_URL).await {
+                monitor_connection(&app, socket).await;
             }
 
-            // Retry after 5 seconds
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            publish_connection_status(&app, false);
+            tokio::time::sleep(RETRY_DELAY).await;
         }
     });
 }
