@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A native desktop companion for osu!, tosu, and Hanami"
 authors = ["yorunoken"]
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/hanami-osu/companion"
 
 [lib]

@@ -78,3 +78,9 @@ The tosu socket, dashboard, and artwork endpoints are derived from one loopback 
 New installations do not launch tosu automatically. The **Launch tosu with Companion** setting must be enabled explicitly after the user understands the local dependency. Existing settings files keep an explicit value, and legacy files created before the setting was stored retain the previous enabled behavior for compatibility.
 
 The packaged CSP permits images from loopback HTTP ports because the tosu port is persisted at runtime while Tauri's production CSP is generated statically at build time. Access remains limited to `127.0.0.1`; arbitrary remote image, script, and connection origins are not allowed.
+
+## License
+
+Copyright © 2026 Muhammed Fatih and hanami-osu contributors.
+
+This project is licensed under the GNU Affero General Public License version 3 only (`AGPL-3.0-only`). See [LICENSE](./LICENSE) and [LICENSING.md](./LICENSING.md) for the full terms, earlier-release notices, third-party material, and branding policy.
